@@ -63,6 +63,7 @@ Statistics::OperatorStatistics::OperatorType Statistics::OperatorStatistics::
         stat_node_type = Statistics::OperatorStatistics::OperatorType::COMM;
         break;
     case ChakraNodeType::INVALID_NODE:
+    case ChakraNodeType::METADATA_NODE:
         stat_node_type = Statistics::OperatorStatistics::OperatorType::INVALID;
         break;
     default:
@@ -100,19 +101,18 @@ void Statistics::extract_comp_comm_overlap() {
             has_comm = true;
             break;
         default:
-            throw std::runtime_error(
-                "Only GPU and COMM types are supported for overlap extraction");
+            break;
         }
     }
     if (!has_comp || !has_comm) {
         this->comp_comm_overlap = 0;
         return;
     }
-    Tick overlap = 0;
-    overlap = this->type_time.at(OperatorStatistics::OperatorType::GPU) +
-              this->type_time.at(OperatorStatistics::OperatorType::COMM) -
-              this->wall_time;
-    this->comp_comm_overlap = overlap;
+    Tick gpu_comm_time =
+        this->type_time.at(OperatorStatistics::OperatorType::GPU) +
+        this->type_time.at(OperatorStatistics::OperatorType::COMM);
+    this->comp_comm_overlap =
+        gpu_comm_time > this->wall_time ? gpu_comm_time - this->wall_time : 0;
 }
 
 Tick Statistics::_calculateTotalRuntimeFromIntervals(

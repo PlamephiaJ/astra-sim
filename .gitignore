@@ -29,3 +29,6 @@ build/astra_htsim/build/
 
 # runs
 runs
+
+# custom ignore rules
+datasets/
