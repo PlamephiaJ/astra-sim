@@ -32,3 +32,5 @@ runs
 
 # custom ignore rules
 datasets/
+outputs/
+ns-3.47/

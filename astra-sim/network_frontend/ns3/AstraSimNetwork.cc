@@ -32,6 +32,17 @@ using namespace std;
 using namespace ns3;
 using json = nlohmann::json;
 
+extern double comm_scale;
+
+static uint64_t scale_message_size(uint64_t message_size) {
+    uint64_t scaled_message_size =
+        static_cast<uint64_t>(message_size * comm_scale);
+    if (message_size > 0 && scaled_message_size == 0) {
+        scaled_message_size = 1;
+    }
+    return scaled_message_size;
+}
+
 /**
  * @class NS3BackendCompletionTracker
  * @brief Tracks the completion status of ranks in the NS3 backend.
@@ -128,6 +139,7 @@ class ASTRASimNetwork : public AstraSim::AstraNetworkAPI {
                          void (*msg_handler)(void* fun_arg),
                          void* fun_arg) {
         int src_id = rank;
+        message_size = scale_message_size(message_size);
 
         // Trigger ns3 to schedule RDMA QP event.
         send_flow(src_id, dst_id, message_size, msg_handler, fun_arg, tag);
@@ -143,6 +155,7 @@ class ASTRASimNetwork : public AstraSim::AstraNetworkAPI {
                          void (*msg_handler)(void* fun_arg),
                          void* fun_arg) {
         int dst_id = rank;
+        message_size = scale_message_size(message_size);
         MsgEvent recv_event =
             MsgEvent(src_id, dst_id, 1, message_size, fun_arg, msg_handler);
         MsgEventKey recv_event_key =
