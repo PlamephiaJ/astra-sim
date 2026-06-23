@@ -10,6 +10,7 @@ SYSTEM="${PROJECT_DIR}/examples/system/native_collectives/Dragonfly_3D_Ring.json
 NETWORK="${PROJECT_DIR}/examples/network/ns3/dragonfly_4_8_4_33_network.txt"
 LOGICAL_TOPOLOGY="${PROJECT_DIR}/examples/network/ns3/dragonfly_4_8_4_33_logical.json"
 MEMORY="${PROJECT_DIR}/examples/remote_memory/analytical/no_memory_expansion.json"
+RUN_DIR="${RUN_DIR:-${PROJECT_DIR}/outputs/ns3_dragonfly_llama3_1056}"
 
 if [[ -z "${ASTRA_SIM_BINARY:-}" ]]; then
     ASTRA_SIM_BINARY=$(find "${NS3_DIR}/build/scratch" -maxdepth 1 -type f \
@@ -35,11 +36,32 @@ for required in \
     fi
 done
 
+mkdir -p "${RUN_DIR}"
+RUN_DIR=$(realpath "${RUN_DIR}")
+
+# The checked-in NS-3 config uses shared output paths under scratch/output.
+# Generate a per-run copy so this run writes directly into RUN_DIR and does not
+# overwrite (or depend on permissions of) another run's files.
+RUN_NETWORK="${RUN_DIR}/network.txt"
+sed \
+    -e "s|^TRACE_OUTPUT_FILE .*|TRACE_OUTPUT_FILE ${RUN_DIR}/trace.tr|" \
+    -e "s|^FCT_OUTPUT_FILE .*|FCT_OUTPUT_FILE ${RUN_DIR}/fct.txt|" \
+    -e "s|^PFC_OUTPUT_FILE .*|PFC_OUTPUT_FILE ${RUN_DIR}/pfc.txt|" \
+    -e "s|^QLEN_MON_FILE .*|QLEN_MON_FILE ${RUN_DIR}/qlen.txt|" \
+    "${NETWORK}" > "${RUN_NETWORK}"
+
 cd "${NS3_DIR}/build/scratch"
-exec "${ASTRA_SIM_BINARY}" \
+set +e
+"${ASTRA_SIM_BINARY}" \
     --workload-configuration="${WORKLOAD}" \
     --comm-group-configuration="${COMM_GROUP}" \
     --system-configuration="${SYSTEM}" \
-    --network-configuration="${NETWORK}" \
+    --network-configuration="${RUN_NETWORK}" \
     --logical-topology-configuration="${LOGICAL_TOPOLOGY}" \
-    --remote-memory-configuration="${MEMORY}"
+    --remote-memory-configuration="${MEMORY}" \
+    > "${RUN_DIR}/stdout.log" \
+    2> "${RUN_DIR}/stderr.log"
+status=$?
+set -e
+
+exit "${status}"
