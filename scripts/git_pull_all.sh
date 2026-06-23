@@ -84,7 +84,10 @@ pull_current_branch() {
     [[ -n "$branch" ]] || die "$label is on detached HEAD"
 
     log "fast-forwarding $label on $branch"
-    run git -C "$repo" pull --ff-only
+    run git \
+        -c fetch.recurseSubmodules=false \
+        -c submodule.recurse=false \
+        -C "$repo" pull --ff-only
 }
 
 pull_configured_submodule_branches() {
@@ -106,7 +109,10 @@ pull_configured_submodule_branches() {
         else
             run git -C "$repo" switch -c "$branch"
         fi
-        run git -C "$repo" pull --ff-only
+        run git \
+            -c fetch.recurseSubmodules=false \
+            -c submodule.recurse=false \
+            -C "$repo" pull --ff-only
     done < <(submodule_paths)
 }
 
