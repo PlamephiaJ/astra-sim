@@ -179,7 +179,8 @@ has_unpushed_commits() {
         return
     fi
 
-    return 1
+    # No upstream and no same-named remote branch: this is a local-only branch.
+    return 0
 }
 
 submodule_paths() {
