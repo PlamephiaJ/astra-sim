@@ -19,6 +19,9 @@
 #include "astra-sim/network_frontend/ns3/ns3_log_monkey_patch.h"
 
 #include <execinfo.h>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <queue>
@@ -66,8 +69,18 @@ class NS3BackendCompletionTracker {
         if (completion_tracker_[rank] == 0) {
             completion_tracker_[rank] = 1;
             num_unfinished_ranks_--;
+            const auto finished = ns3_progress_finished_ranks.fetch_add(1) + 1;
+            if (finished <= 8 || finished % 32 == 0 ||
+                finished == completion_tracker_.size()) {
+                std::ostringstream msg;
+                msg << "rank-finished rank=" << rank << " finished_ranks="
+                    << finished << "/" << completion_tracker_.size();
+                ns3_progress_log(msg.str());
+            }
         }
         if (num_unfinished_ranks_ == 0) {
+            ns3_progress_set_stage(Ns3ProgressStage::Finished,
+                                   "all ranks finished");
             AstraSim::LoggerFactory::get_logger("network")->debug(
                 "All ranks have finished. Exiting simulation.");
             // cout << "All ranks have finished. Exiting simulation.\n";
@@ -126,6 +139,7 @@ class ASTRASimNetwork : public AstraSim::AstraNetworkAPI {
     virtual void sim_schedule(AstraSim::timespec_t delta,
                               void (*fun_ptr)(void* fun_arg),
                               void* fun_arg) {
+        ns3_progress_last_sim_ns.store(Simulator::Now().GetNanoSeconds());
         Simulator::Schedule(NanoSeconds(delta.time_val), fun_ptr, fun_arg);
         return;
     }
@@ -139,7 +153,10 @@ class ASTRASimNetwork : public AstraSim::AstraNetworkAPI {
                          void (*msg_handler)(void* fun_arg),
                          void* fun_arg) {
         int src_id = rank;
+        ns3_progress_last_sim_ns.store(Simulator::Now().GetNanoSeconds());
         message_size = scale_message_size(message_size);
+        ns3_progress_sim_send_calls.fetch_add(1);
+        ns3_progress_sim_send_bytes.fetch_add(message_size);
 
         // Trigger ns3 to schedule RDMA QP event.
         send_flow(src_id, dst_id, message_size, msg_handler, fun_arg, tag);
@@ -155,7 +172,10 @@ class ASTRASimNetwork : public AstraSim::AstraNetworkAPI {
                          void (*msg_handler)(void* fun_arg),
                          void* fun_arg) {
         int dst_id = rank;
+        ns3_progress_last_sim_ns.store(Simulator::Now().GetNanoSeconds());
         message_size = scale_message_size(message_size);
+        ns3_progress_sim_recv_calls.fetch_add(1);
+        ns3_progress_sim_recv_bytes.fetch_add(message_size);
         MsgEvent recv_event =
             MsgEvent(src_id, dst_id, 1, message_size, fun_arg, msg_handler);
         MsgEventKey recv_event_key =
@@ -296,6 +316,8 @@ int main(int argc, char* argv[]) {
     read_logical_topo_config(logical_topology_configuration, logical_dims);
 
     // Setup network & System layer.
+    ns3_progress_set_stage(
+        Ns3ProgressStage::ConstructSystems, "allocating ASTRA systems");
     vector<ASTRASimNetwork*> networks(num_npus, nullptr);
     vector<AstraSim::Sys*> systems(num_npus, nullptr);
     Analytical::AnalyticalRemoteMemory* mem =
@@ -309,7 +331,14 @@ int main(int argc, char* argv[]) {
             npu_id, workload_configuration, comm_group_configuration,
             system_configuration, mem, networks[npu_id], logical_dims,
             queues_per_dim, injection_scale, comm_scale, rendezvous_protocol);
+        if ((npu_id + 1) % 32 == 0 || npu_id + 1 == num_npus) {
+            std::ostringstream msg;
+            msg << "constructed systems " << (npu_id + 1) << "/"
+                << num_npus;
+            ns3_progress_log(msg.str());
+        }
     }
+    ns3_progress_print_wall_heartbeat(0);
 
     // Initialize ns3 simulation.
     if (auto ok = setup_ns3_simulation(network_configuration); ok == -1) {
@@ -318,11 +347,70 @@ int main(int argc, char* argv[]) {
     }
 
     // Tell workload layer to schedule first events.
+    ns3_progress_set_stage(Ns3ProgressStage::WorkloadFire,
+                           "initial workload fire");
     for (int i = 0; i < num_npus; i++) {
         systems[i]->workload->fire();
+        if ((i + 1) % 32 == 0 || i + 1 == num_npus) {
+            std::ostringstream msg;
+            msg << "workload fire " << (i + 1) << "/" << num_npus;
+            ns3_progress_log(msg.str());
+            ns3_progress_print_sim_snapshot("workload fire progress");
+        }
     }
 
     // Run the simulation by triggering the ns3 event queue.
+    ns3_progress_set_stage(Ns3ProgressStage::SimulatorRun,
+                           "enter Simulator::Run");
+    ns3_progress_print_sim_snapshot("before Simulator::Run");
+
+    uint64_t heartbeat_interval_seconds = 60;
+    if (const char* interval_env =
+            std::getenv("NS3_PROGRESS_INTERVAL_SECONDS")) {
+        try {
+            const auto parsed_interval = std::stoull(interval_env);
+            if (parsed_interval > 0)
+                heartbeat_interval_seconds = parsed_interval;
+        } catch (...) {
+            std::ostringstream msg;
+            msg << "invalid NS3_PROGRESS_INTERVAL_SECONDS=\"" << interval_env
+                << "\", using default 60";
+            ns3_progress_log(msg.str());
+        }
+    }
+    {
+        std::ostringstream msg;
+        msg << "wall heartbeat interval_s=" << heartbeat_interval_seconds;
+        ns3_progress_log(msg.str());
+    }
+
+    std::atomic<bool> heartbeat_stop{false};
+    const auto heartbeat_start = std::chrono::steady_clock::now();
+    std::thread wall_heartbeat(
+        [&heartbeat_stop, heartbeat_start, heartbeat_interval_seconds]() {
+        while (!heartbeat_stop.load()) {
+            for (uint64_t second = 0; second < heartbeat_interval_seconds;
+                 ++second) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (heartbeat_stop.load())
+                    return;
+            }
+            if (heartbeat_stop.load())
+                break;
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    now - heartbeat_start)
+                    .count();
+            ns3_progress_print_wall_heartbeat(
+                static_cast<uint64_t>(elapsed));
+        }
+    });
+
     Simulator::Run();
+    heartbeat_stop.store(true);
+    if (wall_heartbeat.joinable())
+        wall_heartbeat.join();
+    ns3_progress_print_sim_snapshot("after Simulator::Run");
     return 0;
 }

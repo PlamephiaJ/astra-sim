@@ -101,3 +101,16 @@ set_target_properties(AstraSim
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/../lib/
     ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/../lib/
 )
+
+option(ASTRA_BUILD_REPEATED_FEEDER_SMOKE_TEST
+       "Build the experimental repeated ET feeder smoke test" OFF)
+if(ASTRA_BUILD_REPEATED_FEEDER_SMOKE_TEST)
+    add_executable(RepeatedFeederSmoke tests/repeated_feeder_smoke.cpp)
+    target_link_libraries(RepeatedFeederSmoke PRIVATE AstraSim)
+    add_executable(MaterializeRepeatedEt utils/materialize_repeated_et.cpp)
+    target_link_libraries(MaterializeRepeatedEt PRIVATE AstraSim)
+    add_executable(CompareRepeatedEtFeeder utils/compare_repeated_et_feeder.cpp)
+    target_link_libraries(CompareRepeatedEtFeeder PRIVATE AstraSim)
+    add_executable(InspectInitialReady utils/inspect_initial_ready.cpp)
+    target_link_libraries(InspectInitialReady PRIVATE AstraSim)
+endif()

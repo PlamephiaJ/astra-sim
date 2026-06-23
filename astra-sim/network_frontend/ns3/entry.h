@@ -2,6 +2,7 @@
 #define PATH_TO_PGO_CONFIG "path_to_pgo_config"
 
 #include "common.h"
+#include "astra-sim/common/ProgressCounters.hh"
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
 #include "ns3/error-model.h"
@@ -11,6 +12,7 @@
 #include "ns3/packet.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/qbb-helper.h"
+#include <atomic>
 #include <fstream>
 #include <iostream>
 #include <ns3/rdma-client-helper.h>
@@ -24,6 +26,93 @@
 
 using namespace ns3;
 using namespace std;
+
+enum class Ns3ProgressStage : int {
+  Startup = 0,
+  ConstructSystems = 1,
+  SetupNetwork = 2,
+  WorkloadFire = 3,
+  SimulatorRun = 4,
+  Finished = 5,
+};
+
+std::atomic<int> ns3_progress_stage{
+    static_cast<int>(Ns3ProgressStage::Startup)};
+std::atomic<uint64_t> ns3_progress_finished_ranks{0};
+std::atomic<uint64_t> ns3_progress_sim_send_calls{0};
+std::atomic<uint64_t> ns3_progress_sim_send_bytes{0};
+std::atomic<uint64_t> ns3_progress_sim_recv_calls{0};
+std::atomic<uint64_t> ns3_progress_sim_recv_bytes{0};
+std::atomic<uint64_t> ns3_progress_send_flow_calls{0};
+std::atomic<uint64_t> ns3_progress_send_flow_bytes{0};
+std::atomic<uint64_t> ns3_progress_qp_finish_calls{0};
+std::atomic<uint64_t> ns3_progress_sender_finished_calls{0};
+std::atomic<uint64_t> ns3_progress_receiver_notify_calls{0};
+std::atomic<uint64_t> ns3_progress_callback_calls{0};
+std::atomic<uint64_t> ns3_progress_send_callback_calls{0};
+std::atomic<uint64_t> ns3_progress_recv_callback_calls{0};
+std::atomic<uint64_t> ns3_progress_last_sim_ns{0};
+
+const char *ns3_progress_stage_name() {
+  switch (static_cast<Ns3ProgressStage>(ns3_progress_stage.load())) {
+  case Ns3ProgressStage::Startup:
+    return "startup";
+  case Ns3ProgressStage::ConstructSystems:
+    return "construct-systems";
+  case Ns3ProgressStage::SetupNetwork:
+    return "setup-network";
+  case Ns3ProgressStage::WorkloadFire:
+    return "workload-fire";
+  case Ns3ProgressStage::SimulatorRun:
+    return "simulator-run";
+  case Ns3ProgressStage::Finished:
+    return "finished";
+  }
+  return "unknown";
+}
+
+void ns3_progress_set_stage(Ns3ProgressStage stage, const string &detail) {
+  ns3_progress_stage.store(static_cast<int>(stage));
+  std::ostringstream msg;
+  msg << "stage=" << ns3_progress_stage_name();
+  if (!detail.empty())
+    msg << " detail=\"" << detail << "\"";
+  ns3_progress_log(msg.str());
+}
+
+void ns3_progress_print_wall_heartbeat(uint64_t elapsed_seconds) {
+  using namespace AstraSim::ProgressCounters;
+  std::ostringstream msg;
+  msg << "heartbeat=wall"
+      << " elapsed_s=" << elapsed_seconds
+      << " sim_ns=" << ns3_progress_last_sim_ns.load()
+      << " stage=" << ns3_progress_stage_name()
+      << " finished_ranks=" << ns3_progress_finished_ranks.load()
+      << " astra_schedule=" << sys_schedule_calls.load()
+      << " astra_handle=" << sys_handle_event_calls.load()
+      << " astra_call_events=" << sys_call_events_calls.load()
+      << " astra_events_registered=" << sys_events_registered.load()
+      << " astra_events_completed=" << sys_events_completed.load()
+      << " astra_events_pending=" << sys_events_pending.load()
+      << " ready_set=" << workload_ready_set_nodes.load()
+      << " ready_queue=" << workload_ready_queue_nodes.load()
+      << " issue_dep_free=" << workload_issue_dep_free_calls.load()
+      << " issue_total=" << workload_issue_total.load()
+      << " issue_comp=" << workload_issue_comp.load()
+      << " issue_coll=" << workload_issue_coll.load()
+      << " issue_send=" << workload_issue_send.load()
+      << " issue_recv=" << workload_issue_recv.load()
+      << " sim_send=" << ns3_progress_sim_send_calls.load()
+      << " sim_recv=" << ns3_progress_sim_recv_calls.load()
+      << " send_flow=" << ns3_progress_send_flow_calls.load()
+      << " qp_finish=" << ns3_progress_qp_finish_calls.load()
+      << " callbacks=" << ns3_progress_callback_calls.load()
+      << " send_callbacks=" << ns3_progress_send_callback_calls.load()
+      << " recv_callbacks=" << ns3_progress_recv_callback_calls.load()
+      << " send_bytes=" << ns3_progress_sim_send_bytes.load()
+      << " recv_bytes=" << ns3_progress_sim_recv_bytes.load();
+  ns3_progress_log(msg.str());
+}
 
 /*
  * This file defines the interaction between the System layer and the NS3
@@ -68,6 +157,11 @@ public:
 
   // CallHandler will call the callback handler associated with this MsgEvent.
   void callHandler() {
+    ns3_progress_callback_calls.fetch_add(1);
+    if (type == 0)
+      ns3_progress_send_callback_calls.fetch_add(1);
+    else if (type == 1)
+      ns3_progress_recv_callback_calls.fetch_add(1);
     msg_handler(fun_arg);
     return;
   }
@@ -120,10 +214,46 @@ map<MsgEventKey, MsgEvent> sim_recv_waiting_hash;
 //   System layer has not yet called sim_recv
 map<MsgEventKey, int> received_msg_standby_hash;
 
+void ns3_progress_print_sim_snapshot(const string &reason) {
+  using namespace AstraSim::ProgressCounters;
+  ns3_progress_last_sim_ns.store(Simulator::Now().GetNanoSeconds());
+  std::ostringstream msg;
+  msg << "heartbeat=sim"
+      << " reason=\"" << reason << "\""
+      << " sim_ns=" << ns3_progress_last_sim_ns.load()
+      << " stage=" << ns3_progress_stage_name()
+      << " finished_ranks=" << ns3_progress_finished_ranks.load()
+      << " astra_schedule=" << sys_schedule_calls.load()
+      << " astra_handle=" << sys_handle_event_calls.load()
+      << " astra_call_events=" << sys_call_events_calls.load()
+      << " astra_events_registered=" << sys_events_registered.load()
+      << " astra_events_completed=" << sys_events_completed.load()
+      << " astra_events_pending=" << sys_events_pending.load()
+      << " ready_set=" << workload_ready_set_nodes.load()
+      << " ready_queue=" << workload_ready_queue_nodes.load()
+      << " issue_dep_free=" << workload_issue_dep_free_calls.load()
+      << " issue_total=" << workload_issue_total.load()
+      << " issue_comp=" << workload_issue_comp.load()
+      << " issue_coll=" << workload_issue_coll.load()
+      << " issue_send=" << workload_issue_send.load()
+      << " issue_recv=" << workload_issue_recv.load()
+      << " sim_send=" << ns3_progress_sim_send_calls.load()
+      << " sim_recv=" << ns3_progress_sim_recv_calls.load()
+      << " send_flow=" << ns3_progress_send_flow_calls.load()
+      << " qp_finish=" << ns3_progress_qp_finish_calls.load()
+      << " callbacks=" << ns3_progress_callback_calls.load()
+      << " send_waiting=" << sim_send_waiting_hash.size()
+      << " recv_waiting=" << sim_recv_waiting_hash.size()
+      << " recv_standby=" << received_msg_standby_hash.size();
+  ns3_progress_log(msg.str());
+}
+
 // send_flow commands the ns3 simulator to schedule a RDMA message to be sent
 // between two pair of nodes. send_flow is triggered by sim_send.
 void send_flow(int src_id, int dst, int maxPacketCount,
                void (*msg_handler)(void *fun_arg), void *fun_arg, int tag) {
+  ns3_progress_send_flow_calls.fetch_add(1);
+  ns3_progress_send_flow_bytes.fetch_add(maxPacketCount);
   // Get a new port number.
   uint32_t port = portNumber[src_id][dst]++;
   sender_src_port_map[make_pair(port, make_pair(src_id, dst))] = tag;
@@ -157,6 +287,7 @@ void send_flow(int src_id, int dst, int maxPacketCount,
 // is called.
 void notify_receiver_receive_data(int src_id, int dst_id, int message_size,
                                   int tag) {
+  ns3_progress_receiver_notify_calls.fetch_add(1);
 
   MsgEventKey recv_expect_event_key = make_pair(tag, make_pair(src_id, dst_id));
 
@@ -204,6 +335,7 @@ void notify_receiver_receive_data(int src_id, int dst_id, int message_size,
 
 void notify_sender_sending_finished(int src_id, int dst_id, int message_size,
                                     int tag, int src_port) {
+  ns3_progress_sender_finished_calls.fetch_add(1);
   // Lookup the send_event registered at send_flow().
   pair<MsgEventKey, int> send_event_key = make_pair(make_pair(tag, make_pair(src_id, dst_id)), src_port);
   if (sim_send_waiting_hash.find(send_event_key) == sim_send_waiting_hash.end()) {
@@ -257,6 +389,7 @@ void qp_finish_print_log(FILE *fout, Ptr<RdmaQueuePair> q) {
 // instance created at send_flow. This registration is done at
 // common.h::SetupNetwork().
 void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
+  ns3_progress_qp_finish_calls.fetch_add(1);
   uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
   qp_finish_print_log(fout, q);
 
@@ -282,14 +415,18 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
 }
 
 int setup_ns3_simulation(string network_configuration) {
+  ns3_progress_set_stage(
+      Ns3ProgressStage::SetupNetwork, "ReadConf and SetConfig");
   if (!ReadConf(network_configuration))
     return -1;
 
   SetConfig();
 
+  ns3_progress_set_stage(Ns3ProgressStage::SetupNetwork, "SetupNetwork begin");
   if (!SetupNetwork(qp_finish)) {
     return -1;
   }
+  ns3_progress_print_sim_snapshot("SetupNetwork complete");
 
   return 0;
 

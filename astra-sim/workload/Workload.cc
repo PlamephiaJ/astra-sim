@@ -6,6 +6,7 @@ LICENSE file in the root directory of this source tree.
 #include "astra-sim/workload/Workload.hh"
 
 #include "astra-sim/common/Logging.hh"
+#include "astra-sim/common/ProgressCounters.hh"
 #include "astra-sim/system/IntData.hh"
 #include "astra-sim/system/MemEventHandlerData.hh"
 #include "astra-sim/system/RecvPacketEventHandlerData.hh"
@@ -24,6 +25,42 @@ using json = nlohmann::json;
 
 typedef ChakraProtoMsg::NodeType ChakraNodeType;
 typedef ChakraProtoMsg::CollectiveCommType ChakraCollectiveCommType;
+
+namespace {
+void record_workload_issue_type(ChakraNodeType node_type) {
+    using namespace AstraSim::ProgressCounters;
+    workload_issue_total.fetch_add(1);
+    switch (node_type) {
+    case ChakraNodeType::METADATA_NODE:
+        workload_issue_metadata.fetch_add(1);
+        break;
+    case ChakraNodeType::MEM_LOAD_NODE:
+        workload_issue_mem_load.fetch_add(1);
+        break;
+    case ChakraNodeType::MEM_STORE_NODE:
+        workload_issue_mem_store.fetch_add(1);
+        break;
+    case ChakraNodeType::COMP_NODE:
+        workload_issue_comp.fetch_add(1);
+        break;
+    case ChakraNodeType::COMM_COLL_NODE:
+        workload_issue_coll.fetch_add(1);
+        break;
+    case ChakraNodeType::COMM_SEND_NODE:
+        workload_issue_send.fetch_add(1);
+        break;
+    case ChakraNodeType::COMM_RECV_NODE:
+        workload_issue_recv.fetch_add(1);
+        break;
+    case ChakraNodeType::INVALID_NODE:
+        workload_issue_invalid.fetch_add(1);
+        break;
+    default:
+        workload_issue_other.fetch_add(1);
+        break;
+    }
+}
+}  // namespace
 
 Workload::Workload(Sys* sys, string et_filename, string comm_group_filename) {
     string workload_filename = et_filename + "." + to_string(sys->id) + ".et";
@@ -133,20 +170,147 @@ void Workload::issue_pytorch_pg_metadata(
     }
 }
 
-void Workload::issue_dep_free_nodes() {
-    auto& dependancy_resolver = this->et_feeder->getDependancyResolver();
-    auto dependancy_free_nodes =
-        dependancy_resolver.get_dependancy_free_nodes();
-    std::set<uint64_t> dependancy_free_nodes_set;
-    for (const auto node_id : dependancy_free_nodes) {
-        dependancy_free_nodes_set.insert(node_id);
+Workload::ReadyBucket Workload::classify_ready_node(
+    const shared_ptr<Chakra::FeederV3::ETFeederNode>& node) const {
+    if (node->type() == ChakraNodeType::COMM_RECV_NODE) {
+        return ReadyBucket::Recv;
     }
-    for (const auto node_id : dependancy_free_nodes_set) {
-        std::shared_ptr<ETFeederNode> node = et_feeder->lookupNode(node_id);
-        if (hw_resource->is_available(node)) {
-            issue(node);
+    if (node->is_cpu_op<bool>(false)) {
+        return ReadyBucket::Cpu;
+    }
+    if (node->type() == ChakraNodeType::COMP_NODE) {
+        return ReadyBucket::GpuComp;
+    }
+    return ReadyBucket::GpuComm;
+}
+
+void Workload::enqueue_ready_node(Chakra::FeederV3::NodeId node_id,
+                                  bool from_initial_scan) {
+    auto node = et_feeder->lookupNode(node_id);
+    switch (classify_ready_node(node)) {
+    case ReadyBucket::Cpu:
+        ready_cpu_nodes.push_back(node_id);
+        break;
+    case ReadyBucket::GpuComp:
+        ready_gpu_comp_nodes.push_back(node_id);
+        break;
+    case ReadyBucket::GpuComm:
+        ready_gpu_comm_nodes.push_back(node_id);
+        break;
+    case ReadyBucket::Recv:
+        ready_recv_nodes.push_back(node_id);
+        break;
+    }
+
+    ProgressCounters::workload_ready_queue_nodes.fetch_add(1);
+    if (from_initial_scan) {
+        ProgressCounters::workload_ready_initial_enqueued.fetch_add(1);
+    } else {
+        ProgressCounters::workload_ready_released_enqueued.fetch_add(1);
+    }
+}
+
+void Workload::enqueue_ready_nodes(
+    const vector<Chakra::FeederV3::NodeId>& node_ids,
+    bool from_initial_scan) {
+    for (const auto node_id : node_ids) {
+        enqueue_ready_node(node_id, from_initial_scan);
+    }
+}
+
+void Workload::initialize_ready_queue_once() {
+    if (ready_queue_initialized) {
+        return;
+    }
+    ready_queue_initialized = true;
+    auto& dependancy_resolver = this->et_feeder->getDependancyResolver();
+    const auto& dependancy_free_nodes =
+        dependancy_resolver.get_dependancy_free_nodes();
+    ProgressCounters::workload_ready_set_nodes.fetch_add(
+        static_cast<int64_t>(dependancy_free_nodes.size()));
+    for (const auto node_id : dependancy_free_nodes) {
+        enqueue_ready_node(node_id, true);
+    }
+}
+
+bool Workload::issue_one_from_queue(
+    deque<Chakra::FeederV3::NodeId>& queue) {
+    auto& dependancy_resolver = this->et_feeder->getDependancyResolver();
+    while (!queue.empty()) {
+        const auto node_id = queue.front();
+        queue.pop_front();
+        ProgressCounters::workload_ready_queue_nodes.fetch_sub(1);
+
+        const auto& dependancy_free_nodes =
+            dependancy_resolver.get_dependancy_free_nodes();
+        if (dependancy_free_nodes.find(node_id) == dependancy_free_nodes.end()) {
+            continue;
+        }
+
+        auto node = et_feeder->lookupNode(node_id);
+        if (!hw_resource->is_available(node)) {
+            // The node remains dependency-free in the resolver. Put it at the
+            // tail of the same resource bucket and try it again after the
+            // corresponding resource is released by a later callback.
+            enqueue_ready_node(node_id, false);
+            return false;
+        }
+
+        ProgressCounters::workload_ready_dequeued.fetch_add(1);
+        ProgressCounters::workload_ready_set_nodes.fetch_sub(1);
+        issue(node);
+        return true;
+    }
+    return false;
+}
+
+bool Workload::issue_available_ready_nodes() {
+    bool issued_any = false;
+    bool progressed = true;
+    while (progressed) {
+        progressed = false;
+
+        if (hw_resource->num_in_flight_gpu_comm_ops == 0 &&
+            issue_one_from_queue(ready_gpu_comm_nodes)) {
+            issued_any = true;
+            progressed = true;
+        }
+        if (hw_resource->num_in_flight_gpu_comp_ops == 0 &&
+            issue_one_from_queue(ready_gpu_comp_nodes)) {
+            issued_any = true;
+            progressed = true;
+        }
+        if (hw_resource->num_in_flight_cpu_ops == 0 &&
+            issue_one_from_queue(ready_cpu_nodes)) {
+            issued_any = true;
+            progressed = true;
+        }
+
+        // Recv nodes do not occupy the GPU comm resource in HardwareResource,
+        // so drain all currently ready receives after the constrained resource
+        // buckets have had a chance to start work.
+        while (issue_one_from_queue(ready_recv_nodes)) {
+            issued_any = true;
+            progressed = true;
         }
     }
+    return issued_any;
+}
+
+void Workload::finish_node_and_enqueue_children(
+    Chakra::FeederV3::NodeId node_id) {
+    auto released_nodes =
+        this->et_feeder->getDependancyResolver()
+            .finish_node_and_get_released_nodes(node_id);
+    ProgressCounters::workload_ready_set_nodes.fetch_add(
+        static_cast<int64_t>(released_nodes.size()));
+    enqueue_ready_nodes(released_nodes, false);
+}
+
+void Workload::issue_dep_free_nodes() {
+    ProgressCounters::workload_issue_dep_free_calls.fetch_add(1);
+    initialize_ready_queue_once();
+    issue_available_ready_nodes();
 }
 
 void Workload::issue(shared_ptr<Chakra::FeederV3::ETFeederNode> node) {
@@ -159,6 +323,7 @@ void Workload::issue(shared_ptr<Chakra::FeederV3::ETFeederNode> node) {
     }
 
     this->et_feeder->getDependancyResolver().take_node(node->id());
+    record_workload_issue_type(node->type());
     this->hw_resource->occupy(node);
     // stats->record_end will be called in Workload::call
     stats->record_start(node, Sys::boostedTick());
@@ -441,8 +606,7 @@ void Workload::issue_recv_comm(
 
 void Workload::skip_invalid(shared_ptr<Chakra::FeederV3::ETFeederNode> node) {
     const auto node_id = node->id();
-    auto& dependancy_resolver = this->et_feeder->getDependancyResolver();
-    dependancy_resolver.finish_node(node_id);
+    finish_node_and_enqueue_children(node_id);
     auto logger = LoggerFactory::get_logger("workload");
     logger->debug("callback,sys->id={}, tick={}, node->id={}, "
                   "node->name={}, node->type={}",
@@ -493,7 +657,7 @@ void Workload::call(EventType event, CallData* data) {
             this->local_mem_usage_tracker->recordEnd(node, Sys::boostedTick());
         }
 
-        this->et_feeder->getDependancyResolver().finish_node(node_id);
+        finish_node_and_enqueue_children(node_id);
 
         issue_dep_free_nodes();
 
@@ -541,7 +705,7 @@ void Workload::call(EventType event, CallData* data) {
                                                          Sys::boostedTick());
             }
 
-            this->et_feeder->getDependancyResolver().finish_node(wlhd->node_id);
+            finish_node_and_enqueue_children(wlhd->node_id);
 
             issue_dep_free_nodes();
 

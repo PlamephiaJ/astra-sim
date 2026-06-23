@@ -6,9 +6,11 @@ LICENSE file in the root directory of this source tree.
 #ifndef __WORKLOAD_HH__
 #define __WORKLOAD_HH__
 
+#include <deque>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "astra-sim/system/Callable.hh"
 #include "astra-sim/system/CommunicatorGroup.hh"
@@ -65,6 +67,31 @@ class Workload : public Callable {
     bool is_finished;
 
   private:
+    enum class ReadyBucket {
+        Cpu,
+        GpuComp,
+        GpuComm,
+        Recv,
+    };
+
+    void initialize_ready_queue_once();
+    void enqueue_ready_node(Chakra::FeederV3::NodeId node_id,
+                            bool from_initial_scan);
+    void enqueue_ready_nodes(
+        const std::vector<Chakra::FeederV3::NodeId>& node_ids,
+        bool from_initial_scan);
+    void finish_node_and_enqueue_children(Chakra::FeederV3::NodeId node_id);
+    bool issue_one_from_queue(std::deque<Chakra::FeederV3::NodeId>& queue);
+    bool issue_available_ready_nodes();
+    ReadyBucket classify_ready_node(
+        const std::shared_ptr<Chakra::FeederV3::ETFeederNode>& node) const;
+
+    bool ready_queue_initialized = false;
+    std::deque<Chakra::FeederV3::NodeId> ready_cpu_nodes;
+    std::deque<Chakra::FeederV3::NodeId> ready_gpu_comp_nodes;
+    std::deque<Chakra::FeederV3::NodeId> ready_gpu_comm_nodes;
+    std::deque<Chakra::FeederV3::NodeId> ready_recv_nodes;
+
     // From the ET node, find out the corresponding communicator group, and
     // return the pointer. If no communicator group is specified for this ET
     // node, return nullptr.

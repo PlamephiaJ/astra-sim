@@ -9,6 +9,7 @@ LICENSE file in the root directory of this source tree.
 #include <iostream>
 
 #include "astra-sim/common/Logging.hh"
+#include "astra-sim/common/ProgressCounters.hh"
 #include "astra-sim/system/BaseStream.hh"
 #include "astra-sim/system/CollectivePlan.hh"
 #include "astra-sim/system/DataSet.hh"
@@ -459,9 +460,12 @@ void Sys::exit_sim_loop(string msg) {
 void Sys::call(EventType type, CallData* data) {}
 
 void Sys::call_events() {
+    ProgressCounters::sys_call_events_calls.fetch_add(1);
     for (auto& callable : event_queue[Sys::boostedTick()]) {
         try {
             pending_events--;
+            ProgressCounters::sys_events_pending.fetch_sub(1);
+            ProgressCounters::sys_events_completed.fetch_add(1);
             (get<0>(callable))->call(get<1>(callable), get<2>(callable));
         } catch (const std::exception& e) {
             auto logger = LoggerFactory::get_logger("system");
@@ -501,14 +505,18 @@ void Sys::try_register_event(Callable* callable,
         BasicEventHandlerData* data =
             new BasicEventHandlerData(id, EventType::CallEvents);
         data->sys_id = id;
+        ProgressCounters::sys_schedule_calls.fetch_add(1);
         comm_NI->sim_schedule(tmp, &Sys::handleEvent, data);
     }
     delta_cycles = 0;
     pending_events++;
+    ProgressCounters::sys_events_registered.fetch_add(1);
+    ProgressCounters::sys_events_pending.fetch_add(1);
     return;
 }
 
 void Sys::handleEvent(void* arg) {
+    ProgressCounters::sys_handle_event_calls.fetch_add(1);
     if (arg == nullptr) {
         return;
     }
