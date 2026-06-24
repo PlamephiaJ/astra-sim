@@ -11,7 +11,11 @@ SYSTEM="${PROJECT_DIR}/examples/system/native_collectives/Dragonfly_3D_Ring.json
 NETWORK="${PROJECT_DIR}/examples/network/ns3/dragonfly_4_8_4_33_network.txt"
 LOGICAL_TOPOLOGY="${PROJECT_DIR}/examples/network/ns3/dragonfly_4_8_4_33_logical.json"
 MEMORY="${PROJECT_DIR}/examples/remote_memory/analytical/no_memory_expansion.json"
-RUN_DIR="${RUN_DIR:-${PROJECT_DIR}/outputs/ns3_dragonfly_llama3_1056_repeated}"
+
+RUN_BASE_DIR="${RUN_DIR:-${PROJECT_DIR}/outputs/ns3_dragonfly_llama3_1056_repeated}"
+RUN_TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+RUN_DIR="${RUN_BASE_DIR}/${RUN_TIMESTAMP}"
+
 NS3_PROGRESS_INTERVAL_SECONDS="${NS3_PROGRESS_INTERVAL_SECONDS:-60}"
 
 # Every rank keeps its compact ET open for random node lookup. Docker commonly

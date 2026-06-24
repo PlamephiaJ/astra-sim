@@ -83,9 +83,9 @@ ensure_push_branch() {
         if [[ -n "$branch" ]]; then
             log "submodule $submodule_path is detached; switching to configured branch $branch"
             if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
-                run git -C "$repo" switch "$branch"
+                run git -C "$repo" switch "$branch" >&2
             else
-                run git -C "$repo" switch -c "$branch"
+                run git -C "$repo" switch -c "$branch" >&2
             fi
             printf '%s\n' "$branch"
             return

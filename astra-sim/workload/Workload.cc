@@ -81,6 +81,8 @@ Workload::Workload(Sys* sys, string et_filename, string comm_group_filename) {
         exit(EXIT_FAILURE);
     }
     this->et_feeder = new ETFeeder(workload_filename);
+    ProgressCounters::workload_nodes_total.fetch_add(
+        this->et_feeder->total_virtual_nodes());
     this->comm_groups.clear();
     // TODO: parametrize the number of available hardware resources
     this->hw_resource = new HardwareResource(1, sys->id);
@@ -299,6 +301,7 @@ bool Workload::issue_available_ready_nodes() {
 
 void Workload::finish_node_and_enqueue_children(
     Chakra::FeederV3::NodeId node_id) {
+    ProgressCounters::workload_nodes_finished.fetch_add(1);
     auto released_nodes =
         this->et_feeder->getDependancyResolver()
             .finish_node_and_get_released_nodes(node_id);

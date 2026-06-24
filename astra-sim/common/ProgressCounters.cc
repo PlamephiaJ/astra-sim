@@ -21,6 +21,8 @@ std::atomic<uint64_t> workload_ready_released_enqueued{0};
 std::atomic<uint64_t> workload_ready_dequeued{0};
 std::atomic<int64_t> workload_ready_set_nodes{0};
 std::atomic<int64_t> workload_ready_queue_nodes{0};
+std::atomic<uint64_t> workload_nodes_total{0};
+std::atomic<uint64_t> workload_nodes_finished{0};
 
 std::atomic<uint64_t> workload_issue_total{0};
 std::atomic<uint64_t> workload_issue_metadata{0};

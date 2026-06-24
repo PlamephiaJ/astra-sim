@@ -25,6 +25,8 @@ extern std::atomic<uint64_t> workload_ready_released_enqueued;
 extern std::atomic<uint64_t> workload_ready_dequeued;
 extern std::atomic<int64_t> workload_ready_set_nodes;
 extern std::atomic<int64_t> workload_ready_queue_nodes;
+extern std::atomic<uint64_t> workload_nodes_total;
+extern std::atomic<uint64_t> workload_nodes_finished;
 
 extern std::atomic<uint64_t> workload_issue_total;
 extern std::atomic<uint64_t> workload_issue_metadata;

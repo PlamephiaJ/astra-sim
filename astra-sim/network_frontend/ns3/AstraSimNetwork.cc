@@ -61,6 +61,7 @@ static uint64_t scale_message_size(uint64_t message_size) {
 class NS3BackendCompletionTracker {
   public:
     NS3BackendCompletionTracker(int num_ranks) {
+        ns3_progress_total_ranks.store(static_cast<uint64_t>(num_ranks));
         num_unfinished_ranks_ = num_ranks;
         completion_tracker_ = vector<int>(num_ranks, 0);
     }

@@ -14,6 +14,7 @@
 #include "ns3/qbb-helper.h"
 #include <atomic>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <ns3/rdma-client-helper.h>
 #include <ns3/rdma-client.h>
@@ -39,6 +40,7 @@ enum class Ns3ProgressStage : int {
 std::atomic<int> ns3_progress_stage{
     static_cast<int>(Ns3ProgressStage::Startup)};
 std::atomic<uint64_t> ns3_progress_finished_ranks{0};
+std::atomic<uint64_t> ns3_progress_total_ranks{0};
 std::atomic<uint64_t> ns3_progress_sim_send_calls{0};
 std::atomic<uint64_t> ns3_progress_sim_send_bytes{0};
 std::atomic<uint64_t> ns3_progress_sim_recv_calls{0};
@@ -71,6 +73,17 @@ const char *ns3_progress_stage_name() {
   return "unknown";
 }
 
+string ns3_progress_format_epoch(time_t epoch_seconds) {
+  char buffer[64];
+  tm local_time;
+  if (localtime_r(&epoch_seconds, &local_time) == nullptr)
+    return "unknown";
+  if (strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S %z",
+               &local_time) == 0)
+    return "unknown";
+  return string(buffer);
+}
+
 void ns3_progress_set_stage(Ns3ProgressStage stage, const string &detail) {
   ns3_progress_stage.store(static_cast<int>(stage));
   std::ostringstream msg;
@@ -82,12 +95,19 @@ void ns3_progress_set_stage(Ns3ProgressStage stage, const string &detail) {
 
 void ns3_progress_print_wall_heartbeat(uint64_t elapsed_seconds) {
   using namespace AstraSim::ProgressCounters;
+  const auto finished_ranks = ns3_progress_finished_ranks.load();
+  const auto total_ranks = ns3_progress_total_ranks.load();
+  const auto finished_nodes = workload_nodes_finished.load();
+  const auto total_nodes = workload_nodes_total.load();
   std::ostringstream msg;
   msg << "heartbeat=wall"
       << " elapsed_s=" << elapsed_seconds
       << " sim_ns=" << ns3_progress_last_sim_ns.load()
       << " stage=" << ns3_progress_stage_name()
-      << " finished_ranks=" << ns3_progress_finished_ranks.load()
+      << " finished_ranks=" << finished_ranks
+      << " total_ranks=" << total_ranks
+      << " workload_nodes_finished=" << finished_nodes
+      << " workload_nodes_total=" << total_nodes
       << " astra_schedule=" << sys_schedule_calls.load()
       << " astra_handle=" << sys_handle_event_calls.load()
       << " astra_call_events=" << sys_call_events_calls.load()
@@ -110,7 +130,40 @@ void ns3_progress_print_wall_heartbeat(uint64_t elapsed_seconds) {
       << " send_callbacks=" << ns3_progress_send_callback_calls.load()
       << " recv_callbacks=" << ns3_progress_recv_callback_calls.load()
       << " send_bytes=" << ns3_progress_sim_send_bytes.load()
-      << " recv_bytes=" << ns3_progress_sim_recv_bytes.load();
+      << " recv_bytes=" << ns3_progress_sim_recv_bytes.load()
+      << " eta_metric=workload_nodes_finished/workload_nodes_total";
+  if (total_nodes == 0 || elapsed_seconds == 0 || finished_nodes == 0) {
+    msg << " eta_progress_pct=unknown"
+        << " eta_s=unknown"
+        << " eta_finish_wall_s=unknown"
+        << " eta_finish_epoch_s=unknown"
+        << " estimate_finish_at=unknown";
+  } else if (finished_nodes >= total_nodes) {
+    msg << " eta_progress_pct=100.00"
+        << " eta_s=0"
+        << " eta_finish_wall_s=" << elapsed_seconds
+        << " eta_finish_epoch_s=" << time(nullptr)
+        << " estimate_finish_at=\""
+        << ns3_progress_format_epoch(time(nullptr)) << "\"";
+  } else {
+    const auto remaining = total_nodes - finished_nodes;
+    const auto eta_seconds =
+        static_cast<uint64_t>(
+            (static_cast<long double>(remaining) *
+             static_cast<long double>(elapsed_seconds)) /
+            static_cast<long double>(finished_nodes)) +
+        1;
+    const auto progress_pct =
+        100.0L * static_cast<long double>(finished_nodes) /
+        static_cast<long double>(total_nodes);
+    const auto finish_epoch = time(nullptr) + eta_seconds;
+    msg << " eta_progress_pct=" << fixed << setprecision(2) << progress_pct
+        << " eta_s=" << eta_seconds
+        << " eta_finish_wall_s=" << (elapsed_seconds + eta_seconds)
+        << " eta_finish_epoch_s=" << finish_epoch
+        << " estimate_finish_at=\""
+        << ns3_progress_format_epoch(finish_epoch) << "\"";
+  }
   ns3_progress_log(msg.str());
 }
 
@@ -223,6 +276,9 @@ void ns3_progress_print_sim_snapshot(const string &reason) {
       << " sim_ns=" << ns3_progress_last_sim_ns.load()
       << " stage=" << ns3_progress_stage_name()
       << " finished_ranks=" << ns3_progress_finished_ranks.load()
+      << " total_ranks=" << ns3_progress_total_ranks.load()
+      << " workload_nodes_finished=" << workload_nodes_finished.load()
+      << " workload_nodes_total=" << workload_nodes_total.load()
       << " astra_schedule=" << sys_schedule_calls.load()
       << " astra_handle=" << sys_handle_event_calls.load()
       << " astra_call_events=" << sys_call_events_calls.load()
