@@ -142,7 +142,9 @@ class ASTRASimNetwork : public AstraSim::AstraNetworkAPI {
         message_size = scale_message_size(message_size);
 
         // Trigger ns3 to schedule RDMA QP event.
-        send_flow(src_id, dst_id, message_size, msg_handler, fun_arg, tag);
+        send_flow(src_id, dst_id, message_size, msg_handler, fun_arg, tag,
+                  request == nullptr ? ns3::kUnpinnedRdmaPath
+                                     : request->path_id);
         return 0;
     }
 

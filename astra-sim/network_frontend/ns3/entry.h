@@ -18,6 +18,7 @@
 #include <ns3/rdma-client.h>
 #include <ns3/rdma-driver.h>
 #include <ns3/rdma.h>
+#include <ns3/rdma-path-selection.h>
 #include <ns3/sim-setting.h>
 #include <ns3/switch-node.h>
 #include <time.h>
@@ -125,12 +126,27 @@ map<MsgEventKey, int> received_msg_standby_hash;
 // send_flow commands the ns3 simulator to schedule a RDMA message to be sent
 // between two pair of nodes. send_flow is triggered by sim_send.
 void send_flow(int src_id, int dst, int maxPacketCount,
-               void (*msg_handler)(void *fun_arg), void *fun_arg, int tag) {
+               void (*msg_handler)(void *fun_arg), void *fun_arg, int tag,
+               int32_t path_id) {
+  if (path_id < kUnpinnedRdmaPath ||
+      path_id >= kSupportedPinnedRdmaPaths) {
+    std::cerr << "Invalid RDMA path_id " << path_id
+              << "; expected -1 (default), 0, or 1\n";
+    std::exit(1);
+  }
   // Get a new port number.
   uint32_t port = portNumber[src_id][dst]++;
   sender_src_port_map[make_pair(port, make_pair(src_id, dst))] = tag;
-  int pg = 3, dport = 100;
+  int pg = 3;
+  uint16_t dport = EncodeRdmaPathInPort(path_id);
   flow_input.idx++;
+
+  if (enable_path_log) {
+    std::cout << "ASTRA_PATH src=" << src_id << " dst=" << dst
+              << " tag=" << tag << " bytes=" << maxPacketCount
+              << " path=" << path_id << " sport=" << port
+              << " dport=" << dport << std::endl;
+  }
 
   // Create a MsgEvent instance and register callback function.
   MsgEvent send_event =

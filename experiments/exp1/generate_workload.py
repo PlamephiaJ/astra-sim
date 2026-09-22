@@ -44,6 +44,10 @@ Expected workload_spec.json:
 }
 
 Optional per-collective fields:
+  "path_id": 0
+      Pin every generated SEND in this collective to path 0 or path 1.
+      Omit it to retain the NS-3 backend's normal ECMP behavior.
+
   "repetitions": 1
       Repeat the collective sequentially.
 
@@ -84,7 +88,7 @@ from __future__ import annotations
 import argparse
 import json
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -219,6 +223,7 @@ class RankBuilder:
         tag: int,
         name: str,
         parents: Sequence[ChakraNode],
+        path_id: Optional[int],
     ) -> ChakraNode:
         node = self._allocate_node(name, COMM_SEND_NODE)
         node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
@@ -226,6 +231,8 @@ class RankBuilder:
         node.attr.append(ChakraAttr(name="comm_src", int32_val=self.rank))
         node.attr.append(ChakraAttr(name="comm_dst", int32_val=dst))
         node.attr.append(ChakraAttr(name="comm_tag", int32_val=tag))
+        if path_id is not None:
+            node.attr.append(ChakraAttr(name="path_id", int32_val=path_id))
         self._add_deps(node, parents)
         self.nodes.append(node)
         return node
@@ -238,6 +245,7 @@ class RankBuilder:
         tag: int,
         name: str,
         parents: Sequence[ChakraNode],
+        path_id: Optional[int],
     ) -> ChakraNode:
         node = self._allocate_node(name, COMM_RECV_NODE)
         node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
@@ -245,6 +253,8 @@ class RankBuilder:
         node.attr.append(ChakraAttr(name="comm_src", int32_val=src))
         node.attr.append(ChakraAttr(name="comm_dst", int32_val=self.rank))
         node.attr.append(ChakraAttr(name="comm_tag", int32_val=tag))
+        if path_id is not None:
+            node.attr.append(ChakraAttr(name="path_id", int32_val=path_id))
         self._add_deps(node, parents)
         self.nodes.append(node)
         return node
@@ -299,6 +309,7 @@ class CollectiveSpec:
     repetitions: int = 1
     depends_on: Tuple[str, ...] = ()
     bytes_mode: str = "total_per_rank"
+    path_id: Optional[int] = None
 
 
 def parse_collective(raw: Mapping, num_ranks: int) -> CollectiveSpec:
@@ -345,6 +356,11 @@ def parse_collective(raw: Mapping, num_ranks: int) -> CollectiveSpec:
             f"{name}: bytes_mode must be 'total_per_rank' or 'per_peer'"
         )
 
+    path_id_raw = raw.get("path_id")
+    path_id = None if path_id_raw is None else int(path_id_raw)
+    if path_id not in (None, 0, 1):
+        raise ValueError(f"{name}: path_id must be 0 or 1 when specified")
+
     return CollectiveSpec(
         name=name,
         type=coll_type,
@@ -354,6 +370,7 @@ def parse_collective(raw: Mapping, num_ranks: int) -> CollectiveSpec:
         repetitions=repetitions,
         depends_on=depends_on,
         bytes_mode=bytes_mode,
+        path_id=path_id,
     )
 
 
@@ -456,6 +473,7 @@ class ExpansionContext:
         send_parents: Sequence[ChakraNode],
         recv_parents: Sequence[ChakraNode],
         op_name: str,
+        path_id: Optional[int],
     ) -> Tuple[ChakraNode, ChakraNode]:
         tag = self.tags.next()
 
@@ -465,6 +483,7 @@ class ExpansionContext:
             tag=tag,
             name=f"{op_name}_SEND_{src}_TO_{dst}",
             parents=send_parents,
+            path_id=path_id,
         )
 
         recv_node = self.builders[dst].recv(
@@ -473,6 +492,7 @@ class ExpansionContext:
             tag=tag,
             name=f"{op_name}_RECV_{src}_TO_{dst}",
             parents=recv_parents,
+            path_id=path_id,
         )
 
         self.record_flow(collective_name, size)
@@ -543,6 +563,7 @@ def expand_ring_allreduce(
                         f"{spec.name}_REP{repetition}_"
                         f"{phase_short}_ROUND{round_idx}"
                     ),
+                    path_id=spec.path_id,
                 )
 
                 current[src].append(send_node)
@@ -610,6 +631,7 @@ def expand_direct_alltoall(
                 send_parents=initial_frontier.get(src, []),
                 recv_parents=initial_frontier.get(dst, []),
                 op_name=f"{spec.name}_REP{repetition}_DIRECT",
+                path_id=spec.path_id,
             )
 
             current[src].append(send_node)
@@ -703,9 +725,12 @@ def write_comm_group_metadata(
         for index, spec in enumerate(specs)
     }
 
-    with (output_dir / "comm_group.json").open("w", encoding="utf-8") as f:
+    destination = output_dir / "comm_group.json"
+    temporary = output_dir / ".comm_group.json.tmp"
+    with temporary.open("w", encoding="utf-8") as f:
         json.dump(groups, f, indent=2)
         f.write("\n")
+    temporary.replace(destination)
 
 
 def remove_old_et_files(output_dir: Path) -> None:
@@ -733,12 +758,34 @@ def main() -> None:
         help="Output directory "
              "(default: workload/ next to this script)",
     )
+    path_mode = parser.add_mutually_exclusive_group()
+    path_mode.add_argument(
+        "--path-override",
+        type=int,
+        choices=(0, 1),
+        help="Override every collective path_id for the path-0/path-1 tests.",
+    )
+    path_mode.add_argument(
+        "--no-path-pinning",
+        action="store_true",
+        help="Remove path_id from every collective to test legacy ECMP.",
+    )
     args = parser.parse_args()
 
     spec_path = args.spec.resolve()
     output_dir = args.output_dir.resolve()
 
     num_ranks, specs = load_spec(spec_path)
+    if args.path_override is not None:
+        specs = [
+            replace(spec, path_id=args.path_override)
+            for spec in specs
+        ]
+    elif args.no_path_pinning:
+        specs = [
+            replace(spec, path_id=None)
+            for spec in specs
+        ]
 
     output_dir.mkdir(parents=True, exist_ok=True)
     remove_old_et_files(output_dir)
@@ -773,7 +820,8 @@ def main() -> None:
             f"{spec.type}/{spec.algorithm} "
             f"ranks={list(spec.ranks)} "
             f"bytes={spec.bytes} "
-            f"repetitions={spec.repetitions}"
+            f"repetitions={spec.repetitions} "
+            f"path_id={spec.path_id}"
         )
 
         if spec.type == "allreduce" and spec.algorithm == "ring":

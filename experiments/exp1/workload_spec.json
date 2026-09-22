@@ -7,14 +7,16 @@
       "type": "allreduce",
       "algorithm": "ring",
       "ranks": [0, 1, 4, 5],
-      "bytes": 67108864
+      "bytes": 67108864,
+      "path_id": 0
     },
     {
       "name": "a2a_0",
       "type": "alltoall",
       "algorithm": "direct",
       "ranks": [2, 3, 6, 7],
-      "bytes": 67108864
+      "bytes": 67108864,
+      "path_id": 1
     }
   ]
 }

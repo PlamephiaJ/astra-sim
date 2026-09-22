@@ -29,6 +29,7 @@ build/astra_htsim/build/
 
 # runs
 runs
+experiments/exp1/ns3_output/*/
 
 # custom ignore rules
 artifacts/

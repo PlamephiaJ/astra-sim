@@ -33,6 +33,9 @@ struct sim_request {
     uint64_t reqCount;
     uint32_t vnet;
     uint32_t layerNum;
+    // Optional per-message route selection. -1 preserves backend-default
+    // routing; non-negative values select a backend-defined pinned path.
+    int32_t path_id = -1;
 };
 
 class MetaData {

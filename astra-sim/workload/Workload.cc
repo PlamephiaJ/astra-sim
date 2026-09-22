@@ -406,6 +406,7 @@ void Workload::issue_send_comm(
     snd_req.srcRank = src;
     snd_req.dstRank = dst;
     snd_req.reqType = UINT8;
+    snd_req.path_id = node->get_attr<int32_t>("path_id", -1);
     SendPacketEventHandlerData* sehd = new SendPacketEventHandlerData;
     sehd->callable = this;
     sehd->wlhd = new WorkloadLayerHandlerData;
@@ -429,6 +430,7 @@ void Workload::issue_recv_comm(
     const auto tag = node->comm_tag<uint32_t>();
 
     sim_request rcv_req;
+    rcv_req.path_id = node->get_attr<int32_t>("path_id", -1);
     RecvPacketEventHandlerData* rcehd = new RecvPacketEventHandlerData;
     rcehd->wlhd = new WorkloadLayerHandlerData;
     rcehd->wlhd->node_id = node->id();
