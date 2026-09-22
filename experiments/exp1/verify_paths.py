@@ -37,16 +37,18 @@ def expected_path(case: str, src: int, dst: int) -> int:
         return 1
     endpoints = {src, dst}
     if endpoints <= RING:
-        return 0
+        return 1 if case == "reverse" else 0
     if endpoints <= ALL_TO_ALL:
-        return 1
+        return 0 if case == "reverse" else 1
     raise AssertionError(f"flow {src}->{dst} is outside both configured groups")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--case", choices=("mixed", "path0", "path1", "ecmp"), required=True
+        "--case",
+        choices=("mixed", "reverse", "path0", "path1", "ecmp"),
+        required=True,
     )
     parser.add_argument("--log", type=Path, required=True)
     args = parser.parse_args()

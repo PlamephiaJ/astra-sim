@@ -733,6 +733,40 @@ def write_comm_group_metadata(
     temporary.replace(destination)
 
 
+def write_resolved_spec(
+    output_path: Path,
+    num_ranks: int,
+    specs: Sequence[CollectiveSpec],
+) -> None:
+    """Write the normalized, post-override experiment specification."""
+    collectives = []
+    for spec in specs:
+        item = {
+            "name": spec.name,
+            "type": spec.type,
+            "algorithm": spec.algorithm,
+            "ranks": list(spec.ranks),
+            "bytes": spec.bytes,
+            "repetitions": spec.repetitions,
+            "depends_on": list(spec.depends_on),
+            "bytes_mode": spec.bytes_mode,
+        }
+        if spec.path_id is not None:
+            item["path_id"] = spec.path_id
+        collectives.append(item)
+
+    resolved = {
+        "num_ranks": num_ranks,
+        "collectives": collectives,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f".{output_path.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as f:
+        json.dump(resolved, f, indent=2)
+        f.write("\n")
+    temporary.replace(output_path)
+
+
 def remove_old_et_files(output_dir: Path) -> None:
     for path in output_dir.glob("workload.*.et"):
         path.unlink()
@@ -770,6 +804,16 @@ def main() -> None:
         action="store_true",
         help="Remove path_id from every collective to test legacy ECMP.",
     )
+    path_mode.add_argument(
+        "--reverse-paths",
+        action="store_true",
+        help="Invert every configured path_id (0 becomes 1 and 1 becomes 0).",
+    )
+    parser.add_argument(
+        "--resolved-spec-output",
+        type=Path,
+        help="Write the normalized, post-override specification to this path.",
+    )
     args = parser.parse_args()
 
     spec_path = args.spec.resolve()
@@ -786,6 +830,22 @@ def main() -> None:
             replace(spec, path_id=None)
             for spec in specs
         ]
+    elif args.reverse_paths:
+        if any(spec.path_id not in (0, 1) for spec in specs):
+            raise ValueError(
+                "--reverse-paths requires every collective to define path_id 0 or 1"
+            )
+        specs = [
+            replace(spec, path_id=1 - spec.path_id)
+            for spec in specs
+        ]
+
+    if args.resolved_spec_output is not None:
+        write_resolved_spec(
+            args.resolved_spec_output.resolve(),
+            num_ranks,
+            specs,
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     remove_old_et_files(output_dir)
