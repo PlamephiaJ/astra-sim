@@ -1,22 +1,88 @@
 {
+  "_schema": {
+    "description": "Workload is represented as a high-level execution DAG. Each entry in nodes is a DAG node. The generator expands collective nodes into low-level Chakra SEND/RECV nodes and preserves dependencies.",
+
+    "node_types": {
+      "collective": {
+        "description": "A high-level collective communication node. The generator expands it into SEND/RECV DAG nodes.",
+        "required": [
+          "name",
+          "type",
+          "collective",
+          "algorithm",
+          "ranks",
+          "bytes"
+        ],
+        "optional": [
+          "path_id",
+          "depends_on"
+        ]
+      },
+
+      "compute": {
+        "description": "A computation node executed by the listed ranks. The cycles value is written directly to Chakra duration_micros, so one configured unit is one microsecond. In ASTRA-sim replay mode it is converted to 1000 nanosecond-scale simulator ticks (reported as cycles in runtime logs).",
+        "required": [
+          "name",
+          "type",
+          "ranks",
+          "cycles"
+        ],
+        "optional": [
+          "depends_on"
+        ]
+      },
+
+      "join": {
+        "description": "A zero-work synchronization node. It becomes ready only after all nodes listed in depends_on finish.",
+        "required": [
+          "name",
+          "type",
+          "depends_on"
+        ]
+      }
+    },
+
+    "dependency_rules": [
+      "depends_on contains names of predecessor DAG nodes.",
+      "A node becomes ready only after all nodes in depends_on complete.",
+      "An empty depends_on means the node is ready at workload start.",
+      "Collective dependencies are translated by the generator to dependencies on the terminal SEND/RECV nodes of the expanded collective.",
+      "The workload graph must be acyclic."
+    ]
+  },
+
   "num_ranks": 8,
 
-  "collectives": [
+  "nodes": [
     {
       "name": "ar_0",
-      "type": "allreduce",
+      "type": "collective",
+      "collective": "allreduce",
       "algorithm": "ring",
       "ranks": [0, 1, 4, 5],
       "bytes": 67108864,
       "path_id": 0
     },
     {
+      "name": "comp_0",
+      "type": "compute",
+      "ranks": [0, 1, 4, 5],
+      "cycles": 1000,
+      "depends_on": ["ar_0"]
+    },
+    {
       "name": "a2a_0",
-      "type": "alltoall",
+      "type": "collective",
+      "collective": "alltoall",
       "algorithm": "direct",
       "ranks": [2, 3, 6, 7],
       "bytes": 67108864,
       "path_id": 1
+    },
+    {
+      "name": "sink",
+      "type": "join",
+      "depends_on": ["comp_0", "a2a_0"]
     }
   ]
 }

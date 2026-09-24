@@ -3,13 +3,13 @@ USE_DYNAMIC_PFC_THRESHOLD 1
 
 PACKET_PAYLOAD_SIZE 1000
 
-TOPOLOGY_FILE /app/astra-sim/experiments/exp1/physical_topology.txt
-FLOW_FILE /app/astra-sim/experiments/exp1/flow.txt
-TRACE_FILE /app/astra-sim/experiments/exp1/trace.txt
-TRACE_OUTPUT_FILE /app/astra-sim/experiments/exp1/ns3_output/trace.tr
-FCT_OUTPUT_FILE /app/astra-sim/experiments/exp1/ns3_output/fct.txt
-PFC_OUTPUT_FILE /app/astra-sim/experiments/exp1/ns3_output/pfc.txt
-QLEN_MON_FILE /app/astra-sim/experiments/exp1/ns3_output/qlen.txt
+TOPOLOGY_FILE /app/astra-sim/experiments/exp1/fixed/physical_topology.txt
+FLOW_FILE /app/astra-sim/experiments/exp1/fixed/flow.txt
+TRACE_FILE /app/astra-sim/experiments/exp1/fixed/trace.txt
+TRACE_OUTPUT_FILE __OUTPUT_DIR__/trace.tr
+FCT_OUTPUT_FILE __OUTPUT_DIR__/fct.txt
+PFC_OUTPUT_FILE __OUTPUT_DIR__/pfc.txt
+QLEN_MON_FILE __OUTPUT_DIR__/qlen.txt
 QLEN_MON_START 0
 QLEN_MON_END 20000
 

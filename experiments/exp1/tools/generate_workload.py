@@ -1,47 +1,55 @@
 #!/usr/bin/env python3
 """
-Config-driven Chakra P2P workload generator for ASTRA-sim.
+Config-driven Chakra workload generator for ASTRA-sim.
 
-The generator expands collective descriptions in workload_spec.json into
-explicit COMM_SEND_NODE / COMM_RECV_NODE DAGs, avoiding ASTRA-sim's native
-sub-communicator collective execution path.
+The generator expands a high-level DAG in workload_spec.json into explicit
+Chakra COMM_SEND_NODE / COMM_RECV_NODE / COMP_NODE DAGs, avoiding ASTRA-sim's
+native sub-communicator collective execution path.
 
 Currently supported:
   - allreduce + ring
   - alltoall  + direct
+  - compute nodes with rank-local dependencies
+  - zero-work rank-local join nodes
 
 Default directory layout:
 
   exp1/
-  ├── generate_workload.py
+  ├── fixed/
+  ├── tools/
+  │   └── generate_workload.py
   ├── workload_spec.json
-  └── workload/
+  └── log/<timestamp>/<case>/config/workload/
       ├── workload.0.et
       ├── ...
       ├── workload.<N-1>.et
       └── comm_group.json
 
-Expected workload_spec.json:
+Preferred workload_spec.json shape:
 
 {
   "num_ranks": 8,
-  "collectives": [
+  "nodes": [
     {
       "name": "ar_0",
-      "type": "allreduce",
+      "type": "collective",
+      "collective": "allreduce",
       "algorithm": "ring",
       "ranks": [0, 1, 4, 5],
       "bytes": 67108864
     },
     {
-      "name": "a2a_0",
-      "type": "alltoall",
-      "algorithm": "direct",
-      "ranks": [2, 3, 6, 7],
-      "bytes": 67108864
+      "name": "comp_0",
+      "type": "compute",
+      "ranks": [0, 1, 4, 5],
+      "cycles": 1000,
+      "depends_on": ["ar_0"]
     }
   ]
 }
+
+Only the unified top-level "nodes" DAG is accepted. Fields whose names begin
+with "_" are treated as documentation/metadata and ignored.
 
 Optional per-collective fields:
   "path_id": 0
@@ -73,14 +81,18 @@ Notes on semantics:
   * P2P nodes do not need pg_name/comm-group information to execute. A
     comm_group.json is still emitted as experiment metadata and may be passed
     to ASTRA-sim harmlessly.
+  * Compute "cycles" is stored in Chakra's duration_micros field, which is the
+    runtime field consumed by ASTRA-sim's replay-mode COMP implementation.
+  * DAG dependencies are rank-local because Chakra emits one ET per rank. A
+    dependency contributes an edge only where parent and child share a rank.
 
 Usage:
-  python3 generate_workload.py
+  experiments/exp1/run.sh generate mixed
 
-Optional:
-  python3 generate_workload.py \
-      --spec workload_spec.json \
-      --output-dir workload
+Direct tool invocation:
+  python3 experiments/exp1/tools/generate_workload.py \
+      --spec experiments/exp1/workload_spec.json \
+      --output-dir experiments/exp1/log/manual_generate/workload
 """
 
 from __future__ import annotations
@@ -90,7 +102,7 @@ import json
 import struct
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +114,7 @@ try:
         COMM_RECV_NODE,
         COMM_SEND_NODE,
         COMP_NODE,
+        INVALID_NODE,
         GlobalMetadata,
         AttributeProto as ChakraAttr,
         Node as ChakraNode,
@@ -112,6 +125,7 @@ except ImportError:
             COMM_RECV_NODE,
             COMM_SEND_NODE,
             COMP_NODE,
+            INVALID_NODE,
             GlobalMetadata,
             AttributeProto as ChakraAttr,
             Node as ChakraNode,
@@ -259,6 +273,34 @@ class RankBuilder:
         self.nodes.append(node)
         return node
 
+    def compute(
+        self,
+        *,
+        name: str,
+        cycles: int,
+        parents: Sequence[ChakraNode],
+    ) -> ChakraNode:
+        """Add a rank-local Chakra compute node."""
+        node = self._allocate_node(name, COMP_NODE)
+        node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
+        node.duration_micros = cycles
+        self._add_deps(node, parents)
+        self.nodes.append(node)
+        return node
+
+    def join(
+        self,
+        *,
+        name: str,
+        parents: Sequence[ChakraNode],
+    ) -> ChakraNode:
+        """Add an instantaneous rank-local DAG join."""
+        node = self._allocate_node(name, INVALID_NODE)
+        node.attr.append(ChakraAttr(name="is_cpu_op", bool_val=False))
+        self._add_deps(node, parents)
+        self.nodes.append(node)
+        return node
+
     def idle_node(self) -> ChakraNode:
         """
         Add a zero-work COMP node if a rank has no communication nodes.
@@ -296,7 +338,7 @@ class TagAllocator:
 
 
 # ---------------------------------------------------------------------------
-# Collective specification
+# DAG node specification
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -312,8 +354,48 @@ class CollectiveSpec:
     path_id: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class ComputeSpec:
+    name: str
+    ranks: Tuple[int, ...]
+    cycles: int
+    depends_on: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class JoinSpec:
+    name: str
+    depends_on: Tuple[str, ...]
+
+
+NodeSpec = Union[CollectiveSpec, ComputeSpec, JoinSpec]
+
+
+def parse_dependencies(raw: Mapping) -> Tuple[str, ...]:
+    depends_on_raw = raw.get("depends_on", [])
+    if isinstance(depends_on_raw, str):
+        return (depends_on_raw,)
+    return tuple(str(value) for value in depends_on_raw)
+
+
+def parse_ranks(raw: Mapping, num_ranks: int, name: str) -> Tuple[int, ...]:
+    if "ranks" not in raw:
+        raise ValueError(f"{name}: missing required field 'ranks'")
+    ranks = tuple(int(value) for value in raw["ranks"])
+    if not ranks:
+        raise ValueError(f"{name}: ranks must not be empty")
+    if len(set(ranks)) != len(ranks):
+        raise ValueError(f"{name}: ranks must be unique; got {ranks}")
+    for rank in ranks:
+        if rank < 0 or rank >= num_ranks:
+            raise ValueError(
+                f"{name}: rank {rank} is outside valid range [0, {num_ranks - 1}]"
+            )
+    return ranks
+
+
 def parse_collective(raw: Mapping, num_ranks: int) -> CollectiveSpec:
-    required = ("name", "type", "algorithm", "ranks", "bytes")
+    required = ("name", "type", "collective", "algorithm", "ranks", "bytes")
     missing = [key for key in required if key not in raw]
     if missing:
         raise ValueError(f"Collective is missing required fields: {missing}")
@@ -322,19 +404,12 @@ def parse_collective(raw: Mapping, num_ranks: int) -> CollectiveSpec:
     if not name:
         raise ValueError("Collective name cannot be empty")
 
-    coll_type = normalize_collective_type(str(raw["type"]))
+    coll_type = normalize_collective_type(str(raw["collective"]))
     algorithm = normalize_algorithm(str(raw["algorithm"]))
 
-    ranks = tuple(int(x) for x in raw["ranks"])
+    ranks = parse_ranks(raw, num_ranks, name)
     if len(ranks) < 2:
         raise ValueError(f"{name}: collective must contain at least 2 ranks")
-    if len(set(ranks)) != len(ranks):
-        raise ValueError(f"{name}: ranks must be unique; got {ranks}")
-    for rank in ranks:
-        if rank < 0 or rank >= num_ranks:
-            raise ValueError(
-                f"{name}: rank {rank} is outside valid range [0, {num_ranks - 1}]"
-            )
 
     total_bytes = int(raw["bytes"])
     if total_bytes <= 0:
@@ -344,11 +419,7 @@ def parse_collective(raw: Mapping, num_ranks: int) -> CollectiveSpec:
     if repetitions <= 0:
         raise ValueError(f"{name}: repetitions must be > 0")
 
-    depends_on_raw = raw.get("depends_on", [])
-    if isinstance(depends_on_raw, str):
-        depends_on = (depends_on_raw,)
-    else:
-        depends_on = tuple(str(x) for x in depends_on_raw)
+    depends_on = parse_dependencies(raw)
 
     bytes_mode = str(raw.get("bytes_mode", "total_per_rank")).strip().lower()
     if bytes_mode not in ("total_per_rank", "per_peer"):
@@ -374,32 +445,79 @@ def parse_collective(raw: Mapping, num_ranks: int) -> CollectiveSpec:
     )
 
 
-def topological_collective_order(
-    specs: Sequence[CollectiveSpec],
-) -> List[CollectiveSpec]:
+def parse_compute(raw: Mapping, num_ranks: int) -> ComputeSpec:
+    required = ("name", "type", "ranks", "cycles")
+    missing = [key for key in required if key not in raw]
+    if missing:
+        raise ValueError(f"Compute node is missing required fields: {missing}")
+
+    name = str(raw["name"]).strip()
+    if not name:
+        raise ValueError("Compute node name cannot be empty")
+
+    cycles = int(raw["cycles"])
+    if cycles < 0:
+        raise ValueError(f"{name}: cycles must be >= 0")
+
+    return ComputeSpec(
+        name=name,
+        ranks=parse_ranks(raw, num_ranks, name),
+        cycles=cycles,
+        depends_on=parse_dependencies(raw),
+    )
+
+
+def parse_join(raw: Mapping) -> JoinSpec:
+    required = ("name", "type", "depends_on")
+    missing = [key for key in required if key not in raw]
+    if missing:
+        raise ValueError(f"Join node is missing required fields: {missing}")
+
+    name = str(raw["name"]).strip()
+    if not name:
+        raise ValueError("Join node name cannot be empty")
+    depends_on = parse_dependencies(raw)
+    if not depends_on:
+        raise ValueError(f"{name}: join depends_on must not be empty")
+    return JoinSpec(name=name, depends_on=depends_on)
+
+
+def parse_node(raw: Mapping, num_ranks: int) -> NodeSpec:
+    if "type" not in raw:
+        raise ValueError("DAG node is missing required field 'type'")
+    node_type = str(raw["type"]).strip().lower()
+    if node_type == "collective":
+        return parse_collective(raw, num_ranks)
+    if node_type == "compute":
+        return parse_compute(raw, num_ranks)
+    if node_type == "join":
+        return parse_join(raw)
+    raise ValueError(f"Unsupported DAG node type: {raw['type']!r}")
+
+
+def topological_node_order(specs: Sequence[NodeSpec]) -> List[NodeSpec]:
     """
-    Topologically order collectives using depends_on.
-    Independent collectives remain free to execute concurrently because no
-    DAG edges are added between them.
+    Topologically order high-level DAG nodes using depends_on.
+    Independent nodes remain free to execute concurrently.
     """
     by_name = {spec.name: spec for spec in specs}
     if len(by_name) != len(specs):
-        raise ValueError("Collective names must be unique")
+        raise ValueError("DAG node names must be unique")
 
     for spec in specs:
         for parent in spec.depends_on:
             if parent not in by_name:
                 raise ValueError(
-                    f"{spec.name}: depends_on references unknown collective {parent!r}"
+                    f"{spec.name}: depends_on references unknown node {parent!r}"
                 )
 
     state: Dict[str, int] = {}  # 0 absent, 1 visiting, 2 done
-    ordered: List[CollectiveSpec] = []
+    ordered: List[NodeSpec] = []
 
     def visit(name: str) -> None:
         current = state.get(name, 0)
         if current == 1:
-            raise ValueError(f"Cycle detected in collective dependencies at {name!r}")
+            raise ValueError(f"Cycle detected in DAG dependencies at {name!r}")
         if current == 2:
             return
 
@@ -436,21 +554,21 @@ class ExpansionContext:
 
     def dependency_frontier(
         self,
-        spec: CollectiveSpec,
+        ranks: Sequence[int],
+        depends_on: Sequence[str],
     ) -> Dict[int, List[ChakraNode]]:
         """
         Build a rank-local starting frontier from explicit depends_on edges.
 
-        If a dependency collective does not contain a particular child rank,
-        no local edge can be emitted for that rank. For cross-rank joins/barriers,
-        add an explicit synchronization representation in a future expander
-        rather than relying on this local dependency helper.
+        If a dependency node does not contain a particular child rank, no
+        local edge can be emitted for that rank. This helper never creates
+        cross-rank synchronization because Chakra ET dependencies are local.
         """
-        result: Dict[int, List[ChakraNode]] = {rank: [] for rank in spec.ranks}
+        result: Dict[int, List[ChakraNode]] = {rank: [] for rank in ranks}
 
-        for parent_name in spec.depends_on:
+        for parent_name in depends_on:
             parent_terminals = self.terminals[parent_name]
-            for rank in spec.ranks:
+            for rank in ranks:
                 result[rank].extend(parent_terminals.get(rank, []))
 
         return {rank: dedup_nodes(nodes) for rank, nodes in result.items()}
@@ -668,7 +786,7 @@ def expand_collective(
         )
 
     expander = EXPANDERS[key]
-    frontier = ctx.dependency_frontier(spec)
+    frontier = ctx.dependency_frontier(spec.ranks, spec.depends_on)
 
     # Repetitions of the same collective are sequential. Independent
     # collectives remain concurrent unless depends_on says otherwise.
@@ -686,32 +804,84 @@ def expand_collective(
     }
 
 
-def load_spec(path: Path) -> Tuple[int, List[CollectiveSpec]]:
+def expand_compute(ctx: ExpansionContext, spec: ComputeSpec) -> None:
+    frontier = ctx.dependency_frontier(spec.ranks, spec.depends_on)
+    ctx.terminals[spec.name] = {
+        rank: [ctx.builders[rank].compute(
+            name=f"{spec.name}_COMP_RANK{rank}",
+            cycles=spec.cycles,
+            parents=frontier[rank],
+        )]
+        for rank in spec.ranks
+    }
+
+
+def expand_join(ctx: ExpansionContext, spec: JoinSpec) -> None:
+    # A Chakra ET is rank-local. Materialize the join on the union of its
+    # parents' ranks, with edges from every parent present on each rank.
+    ranks = sorted({
+        rank
+        for parent_name in spec.depends_on
+        for rank in ctx.terminals[parent_name]
+    })
+    frontier = ctx.dependency_frontier(ranks, spec.depends_on)
+    ctx.terminals[spec.name] = {
+        rank: [ctx.builders[rank].join(
+            name=f"{spec.name}_JOIN_RANK{rank}",
+            parents=frontier[rank],
+        )]
+        for rank in ranks
+    }
+
+
+def expand_node(ctx: ExpansionContext, spec: NodeSpec) -> None:
+    if isinstance(spec, CollectiveSpec):
+        expand_collective(ctx, spec)
+    elif isinstance(spec, ComputeSpec):
+        expand_compute(ctx, spec)
+    else:
+        expand_join(ctx, spec)
+
+
+def remove_private_fields(value):
+    """Recursively discard schema/comments whose object key starts with '_'."""
+    if isinstance(value, dict):
+        return {
+            key: remove_private_fields(item)
+            for key, item in value.items()
+            if not str(key).startswith("_")
+        }
+    if isinstance(value, list):
+        return [remove_private_fields(item) for item in value]
+    return value
+
+
+def load_spec(path: Path) -> Tuple[int, List[NodeSpec]]:
     with path.open("r", encoding="utf-8") as f:
-        raw = json.load(f)
+        raw = remove_private_fields(json.load(f))
 
     if "num_ranks" not in raw:
         raise ValueError("workload_spec.json must contain 'num_ranks'")
-    if "collectives" not in raw:
-        raise ValueError("workload_spec.json must contain 'collectives'")
+    if "nodes" not in raw:
+        raise ValueError("workload_spec.json must contain 'nodes'")
 
     num_ranks = int(raw["num_ranks"])
     if num_ranks <= 0:
         raise ValueError("num_ranks must be > 0")
 
     specs = [
-        parse_collective(item, num_ranks)
-        for item in raw["collectives"]
+        parse_node(item, num_ranks)
+        for item in raw["nodes"]
     ]
     if not specs:
-        raise ValueError("collectives must not be empty")
+        raise ValueError("nodes must not be empty")
 
-    return num_ranks, topological_collective_order(specs)
+    return num_ranks, topological_node_order(specs)
 
 
 def write_comm_group_metadata(
     output_dir: Path,
-    specs: Sequence[CollectiveSpec],
+    specs: Sequence[NodeSpec],
 ) -> None:
     """
     Emit communicator metadata.
@@ -720,9 +890,10 @@ def write_comm_group_metadata(
     for correctness. It is emitted to preserve the experiment's communicator
     description and to keep existing ASTRA-sim command lines usable.
     """
+    collectives = [spec for spec in specs if isinstance(spec, CollectiveSpec)]
     groups = {
         str(index): list(spec.ranks)
-        for index, spec in enumerate(specs)
+        for index, spec in enumerate(collectives)
     }
 
     destination = output_dir / "comm_group.json"
@@ -736,28 +907,44 @@ def write_comm_group_metadata(
 def write_resolved_spec(
     output_path: Path,
     num_ranks: int,
-    specs: Sequence[CollectiveSpec],
+    specs: Sequence[NodeSpec],
 ) -> None:
     """Write the normalized, post-override experiment specification."""
-    collectives = []
+    nodes = []
     for spec in specs:
-        item = {
-            "name": spec.name,
-            "type": spec.type,
-            "algorithm": spec.algorithm,
-            "ranks": list(spec.ranks),
-            "bytes": spec.bytes,
-            "repetitions": spec.repetitions,
-            "depends_on": list(spec.depends_on),
-            "bytes_mode": spec.bytes_mode,
-        }
-        if spec.path_id is not None:
-            item["path_id"] = spec.path_id
-        collectives.append(item)
+        if isinstance(spec, CollectiveSpec):
+            item = {
+                "name": spec.name,
+                "type": "collective",
+                "collective": spec.type,
+                "algorithm": spec.algorithm,
+                "ranks": list(spec.ranks),
+                "bytes": spec.bytes,
+                "repetitions": spec.repetitions,
+                "depends_on": list(spec.depends_on),
+                "bytes_mode": spec.bytes_mode,
+            }
+            if spec.path_id is not None:
+                item["path_id"] = spec.path_id
+        elif isinstance(spec, ComputeSpec):
+            item = {
+                "name": spec.name,
+                "type": "compute",
+                "ranks": list(spec.ranks),
+                "cycles": spec.cycles,
+                "depends_on": list(spec.depends_on),
+            }
+        else:
+            item = {
+                "name": spec.name,
+                "type": "join",
+                "depends_on": list(spec.depends_on),
+            }
+        nodes.append(item)
 
     resolved = {
         "num_ranks": num_ranks,
-        "collectives": collectives,
+        "nodes": nodes,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_name(f".{output_path.name}.tmp")
@@ -774,30 +961,31 @@ def remove_old_et_files(output_dir: Path) -> None:
 
 def main() -> None:
     script_dir = Path(__file__).resolve().parent
+    exp_dir = script_dir.parent
 
     parser = argparse.ArgumentParser(
-        description="Expand collective specs into explicit Chakra P2P ET files."
+        description="Expand a high-level DAG into explicit Chakra ET files."
     )
     parser.add_argument(
         "--spec",
         type=Path,
-        default=script_dir / "workload_spec.json",
+        default=exp_dir / "workload_spec.json",
         help="Workload specification JSON "
-             "(default: workload_spec.json next to this script)",
+             "(default: workload_spec.json in the exp1 root)",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=script_dir / "workload",
+        default=exp_dir / "log" / "manual_generate" / "workload",
         help="Output directory "
-             "(default: workload/ next to this script)",
+             "(default: log/manual_generate/workload in the exp1 root)",
     )
     path_mode = parser.add_mutually_exclusive_group()
     path_mode.add_argument(
         "--path-override",
         type=int,
         choices=(0, 1),
-        help="Override every collective path_id for the path-0/path-1 tests.",
+        help="Override every collective path_id for path-0/path-1 tests.",
     )
     path_mode.add_argument(
         "--no-path-pinning",
@@ -814,29 +1002,49 @@ def main() -> None:
         type=Path,
         help="Write the normalized, post-override specification to this path.",
     )
+    parser.add_argument(
+        "--compute-cycles-override",
+        type=int,
+        help="Override cycles for every compute node (used by run_sweep.sh).",
+    )
     args = parser.parse_args()
 
     spec_path = args.spec.resolve()
     output_dir = args.output_dir.resolve()
 
     num_ranks, specs = load_spec(spec_path)
+    if args.compute_cycles_override is not None:
+        if args.compute_cycles_override < 0:
+            raise ValueError("--compute-cycles-override must be >= 0")
+        specs = [
+            replace(spec, cycles=args.compute_cycles_override)
+            if isinstance(spec, ComputeSpec) else spec
+            for spec in specs
+        ]
+
     if args.path_override is not None:
         specs = [
             replace(spec, path_id=args.path_override)
+            if isinstance(spec, CollectiveSpec) else spec
             for spec in specs
         ]
     elif args.no_path_pinning:
         specs = [
             replace(spec, path_id=None)
+            if isinstance(spec, CollectiveSpec) else spec
             for spec in specs
         ]
     elif args.reverse_paths:
-        if any(spec.path_id not in (0, 1) for spec in specs):
+        collectives = [
+            spec for spec in specs if isinstance(spec, CollectiveSpec)
+        ]
+        if any(spec.path_id not in (0, 1) for spec in collectives):
             raise ValueError(
                 "--reverse-paths requires every collective to define path_id 0 or 1"
             )
         specs = [
             replace(spec, path_id=1 - spec.path_id)
+            if isinstance(spec, CollectiveSpec) else spec
             for spec in specs
         ]
 
@@ -853,7 +1061,7 @@ def main() -> None:
     ctx = ExpansionContext(num_ranks)
 
     for spec in specs:
-        expand_collective(ctx, spec)
+        expand_node(ctx, spec)
 
     # Keep ET files non-empty even when a generic future experiment has ranks
     # outside all collectives.
@@ -872,36 +1080,44 @@ def main() -> None:
     print()
 
     for spec in specs:
-        flows = ctx.flow_count.get(spec.name, 0)
-        net_bytes = ctx.network_bytes.get(spec.name, 0)
-
-        print(
-            f"[{spec.name}] "
-            f"{spec.type}/{spec.algorithm} "
-            f"ranks={list(spec.ranks)} "
-            f"bytes={spec.bytes} "
-            f"repetitions={spec.repetitions} "
-            f"path_id={spec.path_id}"
-        )
-
-        if spec.type == "allreduce" and spec.algorithm == "ring":
-            n = len(spec.ranks)
+        if isinstance(spec, CollectiveSpec):
+            flows = ctx.flow_count.get(spec.name, 0)
+            net_bytes = ctx.network_bytes.get(spec.name, 0)
             print(
-                f"  ring order:       {' -> '.join(map(str, spec.ranks))} "
-                f"-> {spec.ranks[0]}"
+                f"[{spec.name}] collective {spec.type}/{spec.algorithm} "
+                f"ranks={list(spec.ranks)} bytes={spec.bytes} "
+                f"repetitions={spec.repetitions} path_id={spec.path_id}"
             )
-            print(f"  rounds/repetition:{2 * (n - 1)}")
-            print(f"  chunk bytes:      {spec.bytes // n}")
 
-        elif spec.type == "alltoall" and spec.algorithm == "direct":
-            if spec.bytes_mode == "total_per_rank":
-                print(f"  peer bytes:       {spec.bytes // len(spec.ranks)}")
-            else:
-                print(f"  peer bytes:       {spec.bytes}")
-            print("  peer scheduling:  concurrent/no ring dependency")
+            if spec.type == "allreduce" and spec.algorithm == "ring":
+                n = len(spec.ranks)
+                print(
+                    f"  ring order:       {' -> '.join(map(str, spec.ranks))} "
+                    f"-> {spec.ranks[0]}"
+                )
+                print(f"  rounds/repetition:{2 * (n - 1)}")
+                print(f"  chunk bytes:      {spec.bytes // n}")
 
-        print(f"  network flows:    {flows}")
-        print(f"  network bytes:    {net_bytes}")
+            elif spec.type == "alltoall" and spec.algorithm == "direct":
+                if spec.bytes_mode == "total_per_rank":
+                    print(f"  peer bytes:       {spec.bytes // len(spec.ranks)}")
+                else:
+                    print(f"  peer bytes:       {spec.bytes}")
+                print("  peer scheduling:  concurrent/no ring dependency")
+
+            print(f"  network flows:    {flows}")
+            print(f"  network bytes:    {net_bytes}")
+        elif isinstance(spec, ComputeSpec):
+            print(
+                f"[{spec.name}] compute ranks={list(spec.ranks)} "
+                f"cycles={spec.cycles} depends_on={list(spec.depends_on)}"
+            )
+        else:
+            ranks = sorted(ctx.terminals[spec.name])
+            print(
+                f"[{spec.name}] join ranks={ranks} "
+                f"depends_on={list(spec.depends_on)}"
+            )
         print()
 
     print("ASTRA workload prefix:")

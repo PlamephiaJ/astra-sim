@@ -64,8 +64,9 @@ def load_result(directory: Path) -> Result:
 
     resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
     collective_paths: dict[str, str] = {}
-    for collective in resolved["collectives"]:
-        collective_paths[collective["type"]] = path_label(collective.get("path_id"))
+    for node in resolved["nodes"]:
+        if node["type"] == "collective":
+            collective_paths[node["collective"]] = path_label(node.get("path_id"))
 
     wall: dict[int, int] = {}
     comm: dict[int, int] = {}
