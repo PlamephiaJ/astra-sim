@@ -13,9 +13,11 @@ LICENSE file in the root directory of this source tree.
 #include "astra-sim/system/WorkloadLayerHandlerData.hh"
 #include <json/json.hpp>
 
+#include <algorithm>
 #include <iostream>
 #include <stdlib.h>
 #include <unistd.h>
+#include <vector>
 
 using namespace std;
 using namespace AstraSim;
@@ -24,6 +26,12 @@ using json = nlohmann::json;
 
 typedef ChakraProtoMsg::NodeType ChakraNodeType;
 typedef ChakraProtoMsg::CollectiveCommType ChakraCollectiveCommType;
+
+bool Workload::oracle_profiling_enabled_ = false;
+
+void Workload::set_oracle_profiling_enabled(bool enabled) {
+    oracle_profiling_enabled_ = enabled;
+}
 
 Workload::Workload(Sys* sys, string et_filename, string comm_group_filename) {
     string workload_filename = et_filename + "." + to_string(sys->id) + ".et";
@@ -406,7 +414,12 @@ void Workload::issue_send_comm(
     snd_req.srcRank = src;
     snd_req.dstRank = dst;
     snd_req.reqType = UINT8;
-    snd_req.path_id = node->get_attr<int32_t>("path_id", -1);
+    snd_req.collective_type =
+        node->get_attr<std::string>("collective_type", "unknown");
+    snd_req.collective_name =
+        node->get_attr<std::string>("collective_name", "unknown");
+    snd_req.flow_id = node->get_attr<std::string>("flow_id", "unknown");
+    snd_req.routing_label = node->get_attr<int32_t>("routing_label", -1);
     SendPacketEventHandlerData* sehd = new SendPacketEventHandlerData;
     sehd->callable = this;
     sehd->wlhd = new WorkloadLayerHandlerData;
@@ -430,7 +443,12 @@ void Workload::issue_recv_comm(
     const auto tag = node->comm_tag<uint32_t>();
 
     sim_request rcv_req;
-    rcv_req.path_id = node->get_attr<int32_t>("path_id", -1);
+    rcv_req.collective_type =
+        node->get_attr<std::string>("collective_type", "unknown");
+    rcv_req.collective_name =
+        node->get_attr<std::string>("collective_name", "unknown");
+    rcv_req.flow_id = node->get_attr<std::string>("flow_id", "unknown");
+    rcv_req.routing_label = node->get_attr<int32_t>("routing_label", -1);
     RecvPacketEventHandlerData* rcehd = new RecvPacketEventHandlerData;
     rcehd->wlhd = new WorkloadLayerHandlerData;
     rcehd->wlhd->node_id = node->id();
@@ -572,6 +590,38 @@ void Workload::report() {
     LoggerFactory::get_logger("workload")
         ->info("sys[{}] finished, {} cycles, exposed communication {} cycles.",
                sys->id, curr_tick, curr_tick - hw_resource->tics_gpu_ops);
+
+    if (oracle_profiling_enabled_) {
+        std::vector<NodeId> node_ids;
+        node_ids.reserve(stats->get_operator_statistics().size());
+        for (const auto& [node_id, unused] :
+             stats->get_operator_statistics()) {
+            (void)unused;
+            node_ids.push_back(node_id);
+        }
+        std::sort(node_ids.begin(), node_ids.end());
+        for (const NodeId node_id : node_ids) {
+            const auto node = et_feeder->lookupNode(node_id);
+            if (!node->has_attr("dag_node_name")) {
+                continue;
+            }
+            const auto& node_stats =
+                stats->get_operator_statistics(node_id);
+            const std::string sample =
+                "ORACLE_SAMPLE node=" +
+                node->get_attr<std::string>("dag_node_name") +
+                " rank=" + std::to_string(sys->id) +
+                " start_ns=" + std::to_string(node_stats.start_time) +
+                " end_ns=" + std::to_string(node_stats.end_time) + "\n";
+            const ssize_t written =
+                write(STDOUT_FILENO, sample.data(), sample.size());
+            if (written != static_cast<ssize_t>(sample.size())) {
+                throw std::runtime_error(
+                    "Failed to write oracle profiling sample");
+            }
+        }
+    }
+
     stats->post_processing();
     stats->report();
     if (this->sys->track_local_mem) {

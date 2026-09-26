@@ -1,0 +1,29 @@
+{
+  "strategy": "ugal_l",
+  "routes": [
+    {
+      "switch": 8,
+      "destinations": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "nonminimal_next_hop": 10,
+      "minimal_hops": 1,
+      "nonminimal_hops": 2
+    },
+    {
+      "switch": 9,
+      "destinations": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "nonminimal_next_hop": 10,
+      "minimal_hops": 1,
+      "nonminimal_hops": 2
+    }
+  ]
+}

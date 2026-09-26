@@ -1,4 +1,5 @@
 #include "astra-sim/common/AstraNetworkAPI.hh"
+#include "astra-sim/network_frontend/ns3/SlackRoutingPolicy.hh"
 #include "astra-sim/system/Sys.hh"
 #include "extern/remote_memory_backend/analytical/AnalyticalRemoteMemory.hh"
 #include <json/json.hpp>
@@ -23,6 +24,7 @@
 #include <iostream>
 #include <queue>
 #include <stdio.h>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -34,6 +36,11 @@ using json = nlohmann::json;
 
 extern double comm_scale;
 
+static AstraSim::SlackRoutingPolicy routing_policy;
+static bool profile_all_short = false;
+static bool use_backend_ecmp = false;
+static bool use_workload_label = false;
+
 static uint64_t scale_message_size(uint64_t message_size) {
     uint64_t scaled_message_size =
         static_cast<uint64_t>(message_size * comm_scale);
@@ -41,6 +48,34 @@ static uint64_t scale_message_size(uint64_t message_size) {
         scaled_message_size = 1;
     }
     return scaled_message_size;
+}
+
+// Return the route selector consumed by NS-3:
+//  -1 -> backend-default flow-stable ECMP
+//   0 -> short route
+//   1 -> long route
+static int32_t select_routing_label(
+    uint64_t message_bytes, const AstraSim::sim_request* request) {
+    (void)message_bytes;
+    if (use_backend_ecmp) {
+        return ns3::kDefaultRoutingLabel;
+    }
+    if (profile_all_short) {
+        return ns3::kShortRoutingLabel;
+    }
+    if (request == nullptr) {
+        throw std::runtime_error(
+            "Routing requires communication request metadata");
+    }
+    if (use_workload_label) {
+        if (request->routing_label != ns3::kShortRoutingLabel &&
+            request->routing_label != ns3::kLongRoutingLabel) {
+            throw std::runtime_error(
+                "workload_label mode requires routing_label 0 or 1");
+        }
+        return request->routing_label;
+    }
+    return routing_policy.routing_label_for(request->collective_name);
 }
 
 /**
@@ -140,11 +175,12 @@ class ASTRASimNetwork : public AstraSim::AstraNetworkAPI {
                          void* fun_arg) {
         int src_id = rank;
         message_size = scale_message_size(message_size);
+        const int32_t routing_label =
+            select_routing_label(message_size, request);
 
         // Trigger ns3 to schedule RDMA QP event.
         send_flow(src_id, dst_id, message_size, msg_handler, fun_arg, tag,
-                  request == nullptr ? ns3::kUnpinnedRdmaPath
-                                     : request->path_id);
+                  routing_label, request->flow_id);
         return 0;
     }
 
@@ -200,6 +236,11 @@ class ASTRASimNetwork : public AstraSim::AstraNetworkAPI {
 
 // Command line arguments and default values.
 string workload_configuration;
+string routing_dag_configuration;
+string oracle_timing_configuration;
+string flow_routing_configuration;
+uint64_t ugal_local_bias_bytes = 0;
+string routing_mode = "oracle";
 string system_configuration;
 string network_configuration;
 string memory_configuration;
@@ -245,11 +286,170 @@ void read_logical_topo_config(string network_configuration,
     queues_per_dim = vector<int>(logical_dims.size(), num_queues_per_dim);
 }
 
+static void update_ugal_l_qp_route(uint32_t sip, uint32_t dip,
+                                   uint16_t sport, uint16_t dport,
+                                   uint16_t pg, bool reverse_direction,
+                                   uint64_t extra_rtt) {
+    const uint32_t data_sip = reverse_direction ? dip : sip;
+    const uint32_t data_dip = reverse_direction ? sip : dip;
+    const uint16_t data_sport = reverse_direction ? dport : sport;
+    const uint32_t source_id = ip_to_node_id(Ipv4Address(data_sip));
+    if (source_id >= n.GetN()) {
+        throw std::runtime_error(
+            "UGAL-L route decision references an invalid source rank");
+    }
+
+    Ptr<RdmaDriver> driver = n.Get(source_id)->GetObject<RdmaDriver>();
+    if (driver == nullptr || driver->m_rdma == nullptr) {
+        throw std::runtime_error(
+            "UGAL-L route decision cannot find the source RDMA driver");
+    }
+    Ptr<RdmaQueuePair> qp =
+        driver->m_rdma->GetQp(data_dip, data_sport, pg);
+    if (qp == nullptr) {
+        throw std::runtime_error(
+            "UGAL-L route decision cannot find the source queue pair");
+    }
+
+    qp->UpdateRouteRtt(reverse_direction, extra_rtt);
+    cout << "NS3_UGAL_QP_UPDATE src=" << qp->GetSrc()
+         << " dst=" << qp->GetDest()
+         << " sport=" << qp->sport
+         << " direction=" << (reverse_direction ? "reverse" : "forward")
+         << " extra_rtt_ns=" << extra_rtt
+         << " base_rtt_ns=" << qp->m_baseRtt
+         << " window_bytes=" << qp->m_win << endl;
+}
+
+static void set_backend_flow_routing_strategy(
+    ns3::FlowRoutingStrategy strategy, uint64_t ugal_bias_bytes) {
+    for (uint32_t node_id = 0; node_id < n.GetN(); ++node_id) {
+        Ptr<SwitchNode> switch_node = DynamicCast<SwitchNode>(n.Get(node_id));
+        if (switch_node != nullptr) {
+            switch_node->SetFlowRoutingStrategy(strategy, ugal_bias_bytes);
+            switch_node->SetRoutingDecisionLogging(true);
+            if (strategy == ns3::FlowRoutingStrategy::UGAL_L) {
+                switch_node->SetUgalLRouteDecisionCallback(
+                    MakeCallback(&update_ugal_l_qp_route));
+            }
+        }
+    }
+}
+
+static void configure_ugal_l() {
+    if (flow_routing_configuration.empty()) {
+        throw std::runtime_error(
+            "ugal_l requires --flow-routing-configuration");
+    }
+
+    ifstream input(flow_routing_configuration);
+    if (!input) {
+        throw std::runtime_error(
+            "Unable to open UGAL-L routing configuration: " +
+            flow_routing_configuration);
+    }
+
+    json config;
+    input >> config;
+    if (config.value("strategy", "") != "ugal_l") {
+        throw std::runtime_error(
+            "UGAL-L routing configuration must declare strategy=ugal_l");
+    }
+
+    set_backend_flow_routing_strategy(
+        ns3::FlowRoutingStrategy::UGAL_L, ugal_local_bias_bytes);
+
+    uint32_t configured_routes = 0;
+    for (const auto& route : config.at("routes")) {
+        const uint32_t switch_id = route.at("switch").get<uint32_t>();
+        const uint32_t next_hop_id =
+            route.at("nonminimal_next_hop").get<uint32_t>();
+        const uint32_t minimal_hops =
+            route.at("minimal_hops").get<uint32_t>();
+        const uint32_t nonminimal_hops =
+            route.at("nonminimal_hops").get<uint32_t>();
+
+        if (switch_id >= n.GetN() || next_hop_id >= n.GetN() ||
+            minimal_hops == 0 || nonminimal_hops <= minimal_hops) {
+            throw std::runtime_error("Invalid UGAL-L route metadata");
+        }
+
+        Ptr<Node> switch_base = n.Get(switch_id);
+        Ptr<Node> next_hop = n.Get(next_hop_id);
+        Ptr<SwitchNode> switch_node =
+            DynamicCast<SwitchNode>(switch_base);
+        if (switch_node == nullptr) {
+            throw std::runtime_error(
+                "UGAL-L source node is not a switch");
+        }
+
+        auto neighbor = nbr2if[switch_base].find(next_hop);
+        if (neighbor == nbr2if[switch_base].end() ||
+            !neighbor->second.up) {
+            throw std::runtime_error(
+                "UGAL-L non-minimal next hop is not an active neighbor");
+        }
+
+        for (const auto& destination : route.at("destinations")) {
+            const uint32_t destination_id = destination.get<uint32_t>();
+            if (destination_id >= static_cast<uint32_t>(num_npus)) {
+                throw std::runtime_error(
+                    "UGAL-L destination is not an active rank");
+            }
+            Ptr<Node> destination_node = n.Get(destination_id);
+            Ipv4Address destination_address =
+                destination_node->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
+            const uint64_t minimal_delay =
+                pairDelay.at(switch_base).at(destination_node);
+            const uint64_t minimal_tx_delay =
+                pairTxDelay.at(switch_base).at(destination_node);
+            const uint64_t nonminimal_delay = neighbor->second.delay +
+                pairDelay.at(next_hop).at(destination_node);
+            const uint64_t first_hop_tx_delay =
+                packet_payload_size * 1000000000lu * 8 /
+                neighbor->second.bw;
+            const uint64_t nonminimal_tx_delay = first_hop_tx_delay +
+                pairTxDelay.at(next_hop).at(destination_node);
+            if (nonminimal_delay < minimal_delay ||
+                nonminimal_tx_delay < minimal_tx_delay) {
+                throw std::runtime_error(
+                    "UGAL-L non-minimal path is shorter than minimal path");
+            }
+            const uint64_t nonminimal_extra_rtt =
+                nonminimal_delay - minimal_delay +
+                nonminimal_tx_delay - minimal_tx_delay;
+            switch_node->AddUgalLRoute(
+                destination_address, neighbor->second.idx, next_hop_id,
+                minimal_hops, nonminimal_hops, nonminimal_extra_rtt);
+            ++configured_routes;
+        }
+    }
+
+    cout << "FLOW_ROUTING strategy=ugal_l routes=" << configured_routes
+         << " bias_bytes=" << ugal_local_bias_bytes << endl;
+}
+
 // Read command line arguments.
 void parse_args(int argc, char* argv[]) {
     CommandLine cmd;
     cmd.AddValue("workload-configuration", "Workload configuration file.",
                  workload_configuration);
+    cmd.AddValue("routing-dag-configuration",
+                 "High-level workload DAG used by slack routing.",
+                 routing_dag_configuration);
+    cmd.AddValue("oracle-timing-configuration",
+                 "Measured DAG node timings used by oracle routing.",
+                 oracle_timing_configuration);
+    cmd.AddValue("flow-routing-configuration",
+                 "Backend flow-routing strategy configuration.",
+                 flow_routing_configuration);
+    cmd.AddValue("ugal-local-bias-bytes",
+                 "UGAL-L non-minimal-path bias in byte-hop cost units.",
+                 ugal_local_bias_bytes);
+    cmd.AddValue("routing-mode",
+                 "Routing mode: ecmp, ugal_l, workload_label, "
+                 "profile_all_short, or oracle.",
+                 routing_mode);
     cmd.AddValue("system-configuration", "System configuration file",
                  system_configuration);
     cmd.AddValue("network-configuration", "Network configuration file",
@@ -283,6 +483,8 @@ int main(int argc, char* argv[]) {
 
     // Read network config and find logical dims.
     parse_args(argc, argv);
+    AstraSim::Workload::set_oracle_profiling_enabled(
+        routing_mode == "profile_all_short");
     AstraSim::LoggerFactory::init(logging_configuration);
     read_logical_topo_config(logical_topology_configuration, logical_dims);
 
@@ -306,6 +508,24 @@ int main(int argc, char* argv[]) {
     if (auto ok = setup_ns3_simulation(network_configuration); ok == -1) {
         std::cerr << "Fail to setup ns3 simulation." << std::endl;
         return -1;
+    }
+
+    if (routing_mode == "ecmp") {
+        use_backend_ecmp = true;
+        set_backend_flow_routing_strategy(
+            ns3::FlowRoutingStrategy::ECMP, 0);
+    } else if (routing_mode == "ugal_l") {
+        use_backend_ecmp = true;
+        configure_ugal_l();
+    } else if (routing_mode == "profile_all_short") {
+        profile_all_short = true;
+    } else if (routing_mode == "workload_label") {
+        use_workload_label = true;
+    } else if (routing_mode == "oracle") {
+        routing_policy.initialize(routing_dag_configuration,
+                                  oracle_timing_configuration);
+    } else {
+        throw std::runtime_error("Unknown routing mode '" + routing_mode + "'");
     }
 
     // Tell workload layer to schedule first events.

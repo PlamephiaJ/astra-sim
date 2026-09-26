@@ -106,10 +106,10 @@ generate_case() {
     local args=(--spec "$SPEC" --output-dir "$output_dir")
 
     case "$case_name" in
-        path0) args+=(--path-override 0) ;;
-        path1) args+=(--path-override 1) ;;
-        reverse) args+=(--reverse-paths) ;;
-        ecmp) args+=(--no-path-pinning) ;;
+        path0) args+=(--routing-label-override 0) ;;
+        path1) args+=(--routing-label-override 1) ;;
+        reverse) args+=(--invert-routing-labels) ;;
+        ecmp) args+=(--no-routing-label) ;;
         mixed) ;;
     esac
     if [[ -n "${COMPUTE_CYCLES_OVERRIDE:-}" ]]; then
@@ -211,7 +211,7 @@ snapshot_configs() {
         echo "repository=$ROOT"
         echo "binary=$BIN"
         echo "runtime_network_config=$runtime_config"
-        echo "command=$BIN --workload-configuration=$workload_prefix --system-configuration=$SYSTEM --network-configuration=$runtime_config --remote-memory-configuration=$REMOTE_MEMORY --logical-topology-configuration=$LOGICAL_TOPOLOGY"
+        echo "command=$BIN --routing-mode=workload_label --workload-configuration=$workload_prefix --system-configuration=$SYSTEM --network-configuration=$runtime_config --remote-memory-configuration=$REMOTE_MEMORY --logical-topology-configuration=$LOGICAL_TOPOLOGY"
         git -C "$ROOT" rev-parse HEAD 2>/dev/null | sed 's/^/git_commit=/' || true
     } > "$config_dir/manifest.txt"
 }
@@ -244,7 +244,7 @@ run_case() {
     local log="$run_dir/run.log"
 
     echo "========================================"
-    echo "ASTRA-sim path-pinning experiment"
+    echo "ASTRA-sim routing-label experiment"
     echo "CASE: $case_name"
     echo "RUN:  $run_dir"
     echo "LOG:  $log"
@@ -252,6 +252,7 @@ run_case() {
 
     "$BIN" \
         --workload-configuration="$workload_prefix" \
+        --routing-mode=workload_label \
         --system-configuration="$SYSTEM" \
         --network-configuration="$runtime_config" \
         --remote-memory-configuration="$REMOTE_MEMORY" \

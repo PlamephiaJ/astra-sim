@@ -24,6 +24,8 @@ class DataSet;
 
 class Workload : public Callable {
   public:
+    static void set_oracle_profiling_enabled(bool enabled);
+
     Workload(Sys* sys,
              std::string et_filename,
              std::string comm_group_filename);
@@ -65,6 +67,8 @@ class Workload : public Callable {
     bool is_finished;
 
   private:
+    static bool oracle_profiling_enabled_;
+
     // From the ET node, find out the corresponding communicator group, and
     // return the pointer. If no communicator group is specified for this ET
     // node, return nullptr.

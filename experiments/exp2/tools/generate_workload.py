@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""exp1 entry point for the shared Chakra DAG generator."""
+"""exp2 entry point for the shared flow-aware Chakra DAG generator."""
 
 from __future__ import annotations
 

@@ -15,7 +15,7 @@ STAT_RE = re.compile(
     r"sys\[(?P<rank>\d+)\], (?P<kind>Wall|Comm) time: (?P<cycles>\d+)"
 )
 VERIFY_RE = re.compile(
-    r"PATH VERIFY PASSED case=(?P<case>\w+) flows=(?P<flows>\d+) "
+    r"ROUTE VERIFY PASSED case=(?P<case>\w+) flows=(?P<flows>\d+) "
     r"cross_side_flows=(?P<cross>\d+) "
     r"forwarding_records=(?P<forwarding>\d+) "
     r"finished_ranks=(?P<finished>\d+)"
@@ -49,11 +49,11 @@ class Result:
         return sum(self.comm.values()) / len(self.comm)
 
 
-def path_label(value: object) -> str:
+def route_label(value: object) -> str:
     if value is None:
         return "ECMP"
-    path_id = int(value)
-    return f"path {path_id} ({'short' if path_id == 0 else 'long'})"
+    routing_label = int(value)
+    return f"label {routing_label} ({'short' if routing_label == 0 else 'long'})"
 
 
 def load_result(directory: Path) -> Result:
@@ -66,7 +66,9 @@ def load_result(directory: Path) -> Result:
     collective_paths: dict[str, str] = {}
     for node in resolved["nodes"]:
         if node["type"] == "collective":
-            collective_paths[node["collective"]] = path_label(node.get("path_id"))
+            collective_paths[node["collective"]] = route_label(
+                node.get("routing_label")
+            )
 
     wall: dict[int, int] = {}
     comm: dict[int, int] = {}
@@ -83,7 +85,7 @@ def load_result(directory: Path) -> Result:
     if set(wall) != set(range(8)) or set(comm) != set(range(8)):
         raise ValueError(f"缺少 rank 0..7 的统计数据：{log_path}")
     if verification is None:
-        raise ValueError(f"缺少 PATH VERIFY PASSED：{log_path}")
+        raise ValueError(f"缺少 ROUTE VERIFY PASSED：{log_path}")
 
     case_name = verification["case"]
     return Result(

@@ -18,7 +18,7 @@
 #include <ns3/rdma-client.h>
 #include <ns3/rdma-driver.h>
 #include <ns3/rdma.h>
-#include <ns3/rdma-path-selection.h>
+#include <ns3/rdma-routing-label.h>
 #include <ns3/sim-setting.h>
 #include <ns3/switch-node.h>
 #include <time.h>
@@ -127,24 +127,26 @@ map<MsgEventKey, int> received_msg_standby_hash;
 // between two pair of nodes. send_flow is triggered by sim_send.
 void send_flow(int src_id, int dst, int maxPacketCount,
                void (*msg_handler)(void *fun_arg), void *fun_arg, int tag,
-               int32_t path_id) {
-  if (path_id < kUnpinnedRdmaPath ||
-      path_id >= kSupportedPinnedRdmaPaths) {
-    std::cerr << "Invalid RDMA path_id " << path_id
-              << "; expected -1 (default), 0, or 1\n";
+               int32_t routing_label, const std::string &flow_id) {
+  if (!IsSupportedRoutingLabel(routing_label)) {
+    std::cerr << "Invalid RDMA routing_label " << routing_label
+              << "; expected -1 (default), 0 (short), or 1 (long)\n";
     std::exit(1);
   }
   // Get a new port number.
   uint32_t port = portNumber[src_id][dst]++;
   sender_src_port_map[make_pair(port, make_pair(src_id, dst))] = tag;
   int pg = 3;
-  uint16_t dport = EncodeRdmaPathInPort(path_id);
+  uint16_t dport = EncodeRoutingLabelInPort(routing_label);
   flow_input.idx++;
 
-  if (enable_path_log) {
-    std::cout << "ASTRA_PATH src=" << src_id << " dst=" << dst
+  if (enable_route_log) {
+    std::cout << "ASTRA_ROUTE src=" << src_id << " dst=" << dst
               << " tag=" << tag << " bytes=" << maxPacketCount
-              << " path=" << path_id << " sport=" << port
+              << " label=" << routing_label
+              << " route=" << RoutingLabelName(routing_label)
+              << " flow=" << flow_id
+              << " sport=" << port
               << " dport=" << dport << std::endl;
   }
 

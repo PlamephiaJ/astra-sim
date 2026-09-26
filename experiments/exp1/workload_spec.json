@@ -14,7 +14,7 @@
           "bytes"
         ],
         "optional": [
-          "path_id",
+          "routing_label",
           "depends_on"
         ]
       },
@@ -60,8 +60,8 @@
       "collective": "allreduce",
       "algorithm": "ring",
       "ranks": [0, 1, 4, 5],
-      "bytes": 67108864,
-      "path_id": 0
+      "bytes": 33554432,
+      "routing_label": 0
     },
     {
       "name": "comp_0",
@@ -77,7 +77,7 @@
       "algorithm": "direct",
       "ranks": [2, 3, 6, 7],
       "bytes": 67108864,
-      "path_id": 1
+      "routing_label": 1
     },
     {
       "name": "sink",

@@ -1,0 +1,33 @@
+{
+  "num_ranks": 8,
+  "nodes": [
+    {
+      "name": "ar_0",
+      "type": "collective",
+      "collective": "allreduce",
+      "algorithm": "ring",
+      "ranks": [0, 1, 4, 5],
+      "bytes": 33554432
+    },
+    {
+      "name": "comp_0",
+      "type": "compute",
+      "ranks": [0, 1, 4, 5],
+      "cycles": 1000,
+      "depends_on": ["ar_0"]
+    },
+    {
+      "name": "a2a_0",
+      "type": "collective",
+      "collective": "alltoall",
+      "algorithm": "direct",
+      "ranks": [2, 3, 6, 7],
+      "bytes": 67108864
+    },
+    {
+      "name": "sink",
+      "type": "join",
+      "depends_on": ["comp_0", "a2a_0"]
+    }
+  ]
+}
